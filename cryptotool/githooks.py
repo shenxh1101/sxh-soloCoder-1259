@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .filehandler import DEFAULT_EXT, is_config_file, is_sensitive_file
+from .policy import Policy, PolicyError, load_policy, _pattern_to_regex
 
 
 HOOK_MARKER = "# >>> config-crypt pre-commit hook >>>"
@@ -59,38 +60,6 @@ def _is_ignored(line: str) -> bool:
     return not s or s.startswith("#")
 
 
-def _pattern_to_regex(pattern: str) -> re.Pattern:
-    pattern = pattern.strip()
-    if pattern.startswith("/"):
-        pattern = pattern[1:]
-    regex_parts = []
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            if i + 1 < len(pattern) and pattern[i + 1] == "*":
-                regex_parts.append(".*")
-                i += 2
-                if i < len(pattern) and pattern[i] == "/":
-                    i += 1
-            else:
-                regex_parts.append("[^/]*")
-                i += 1
-        elif c == "?":
-            regex_parts.append("[^/]")
-            i += 1
-        elif c == ".":
-            regex_parts.append(r"\.")
-            i += 1
-        elif c in "+()|^$[]{}":
-            regex_parts.append("\\" + c)
-            i += 1
-        else:
-            regex_parts.append(c)
-            i += 1
-    return re.compile("^" + "".join(regex_parts) + "(?:/.*)?$")
-
-
 def load_patterns(patterns_file: str) -> List[re.Pattern]:
     if not os.path.exists(patterns_file):
         return []
@@ -116,6 +85,7 @@ def match_sensitive_files(
     files: List[str],
     patterns: List[re.Pattern],
     git_root: Optional[str] = None,
+    policy: Optional[Policy] = None,
 ) -> List[str]:
     root = Path(find_git_root(git_root))
     matched = []
@@ -123,6 +93,15 @@ def match_sensitive_files(
         try:
             rel = os.path.relpath(f, str(root)).replace("\\", "/")
         except ValueError:
+            continue
+        if policy and policy.should_ignore(rel):
+            continue
+        if policy and policy.is_allowed_plaintext(rel):
+            continue
+        if f.endswith(DEFAULT_EXT):
+            continue
+        if policy and policy.is_required(rel):
+            matched.append(f)
             continue
         if any(p.match(rel) for p in patterns):
             matched.append(f)
@@ -134,9 +113,17 @@ def match_sensitive_files(
 def generate_hook_script(
     patterns_file: str = ".cryptignore",
     key_file: Optional[str] = None,
+    policy_file: str = ".cryptpolicy",
 ) -> str:
-    key_arg = f'-k {shlex.quote(key_file)}' if key_file else ''
     patterns_arg = shlex.quote(patterns_file)
+    policy_arg = shlex.quote(policy_file)
+    if key_file:
+        abs_key_file = os.path.abspath(key_file)
+        key_file_arg = repr(abs_key_file)
+        key_file_quoted = shlex.quote(abs_key_file)
+    else:
+        key_file_arg = "None"
+        key_file_quoted = '""'
 
     script = f'''\
 #!/usr/bin/env python3
@@ -160,13 +147,20 @@ def run():
     os.chdir(repo_root)
 
     patterns_file = {patterns_arg!r}
+    policy_file = {policy_arg!r}
+    key_file = {key_file_arg}
 
     try:
         cmd = [sys.executable, "-m", "cryptotool.cli", "git-hook", "_precommit"]
         if os.path.exists(patterns_file):
             cmd.extend(["--patterns-file", patterns_file])
-        if {repr(key_file) if key_file else 'None'}:
-            cmd.extend(["-k", {shlex.quote(key_file) if key_file else '""'}])
+        if os.path.exists(policy_file):
+            cmd.extend(["--policy-file", policy_file])
+        if key_file is not None:
+            if not os.path.isabs(key_file):
+                key_file = os.path.join(repo_root, key_file)
+            if os.path.exists(key_file):
+                cmd.extend(["-k", key_file])
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.stdout:
             print(result.stdout, end="")
@@ -189,6 +183,7 @@ def install_hook(
     hook_path: str = ".git/hooks/pre-commit",
     patterns_file: str = ".cryptignore",
     key_file: Optional[str] = None,
+    policy_file: str = ".cryptpolicy",
     force: bool = False,
 ) -> None:
     try:
@@ -212,7 +207,11 @@ def install_hook(
     if hook_dir and not os.path.exists(hook_dir):
         os.makedirs(hook_dir, exist_ok=True)
 
-    script = generate_hook_script(patterns_file=patterns_file, key_file=key_file)
+    script = generate_hook_script(
+        patterns_file=patterns_file,
+        key_file=key_file,
+        policy_file=policy_file,
+    )
 
     if os.path.exists(abs_hook_path):
         with open(abs_hook_path, "r", encoding="utf-8") as f:
@@ -309,6 +308,7 @@ def check_hook(hook_path: str = ".git/hooks/pre-commit") -> HookStatus:
 def precommit_hook_impl(
     patterns_file: str = ".cryptignore",
     key_file: Optional[str] = None,
+    policy_file: str = ".cryptpolicy",
 ) -> int:
     from .keymanager import resolve_key, KeyManagerError
     from .filehandler import encrypt_file, FileHandlerError
@@ -326,7 +326,12 @@ def precommit_hook_impl(
         return 0
 
     patterns = load_patterns(patterns_file) if os.path.exists(patterns_file) else []
-    sensitive = match_sensitive_files(staged, patterns, root)
+    try:
+        policy = load_policy(policy_file, base_dir=root)
+    except PolicyError as e:
+        print(f"[config-crypt] 警告: {e}", file=sys.stderr)
+        policy = None
+    sensitive = match_sensitive_files(staged, patterns, root, policy=policy)
 
     if not sensitive:
         return 0

@@ -23,6 +23,8 @@ from .filehandler import (
     rekey_directory_bulk,
     match_sensitive_files_local,
 )
+from .policy import Policy, PolicyError, load_policy
+from .audit import AuditFileItem, AuditReport, create_report, write_report
 from . import githooks
 from .githooks import (
     get_staged_files,
@@ -71,6 +73,27 @@ def add_new_key_args(parser: argparse.ArgumentParser) -> None:
         "--new-env-key",
         default="CONFIG_CRYPT_NEW_KEY",
         help="新密钥环境变量名称",
+    )
+
+
+def add_audit_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--report",
+        help="输出审计报告到指定文件",
+    )
+    parser.add_argument(
+        "--report-format",
+        choices=["json", "markdown", "md"],
+        default=None,
+        help="报告格式（默认根据扩展名自动识别）",
+    )
+
+
+def add_policy_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--policy-file",
+        default=".cryptpolicy",
+        help="策略配置文件路径（定义必须加密、允许明文、忽略的规则）",
     )
 
 
@@ -128,6 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_encd.add_argument("--all-files", action="store_true", help="加密所有文件，不限于配置文件")
     p_encd.add_argument("-f", "--force", action="store_true", help="覆盖已存在的输出文件")
     add_key_args(p_encd, for_encrypt=True)
+    add_policy_arg(p_encd)
 
     p_decd = sub.add_parser("decrypt-dir", help="批量解密目录内的加密文件")
     p_decd.add_argument("directory", help="目标目录")
@@ -156,12 +180,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("path", help="加密文件或目录路径")
     p_ver.add_argument("--no-recursive", action="store_true", help="目录时不递归子目录")
     add_key_args(p_ver)
+    add_audit_args(p_ver)
+    add_policy_arg(p_ver)
 
     p_rekey = sub.add_parser("rekey", help="更换加密文件/目录的密码或密钥，不破坏明文内容")
     p_rekey.add_argument("path", help="加密文件或目录路径")
     p_rekey.add_argument("--no-recursive", action="store_true", help="目录时不递归子目录")
+    p_rekey.add_argument("--dry-run", action="store_true", help="只列出将被迁移的文件，不实际执行")
+    p_rekey.add_argument("--backup", action="store_true", help="执行前为每个文件创建 .bak 备份，失败时可恢复")
     add_old_key_args(p_rekey)
     add_new_key_args(p_rekey)
+    add_policy_arg(p_rekey)
 
     p_check = sub.add_parser("check", help="扫描目录或 git 暂存区，找出明文敏感文件")
     p_check.add_argument("path", nargs="?", default=".", help="要扫描的目录（默认当前目录）")
@@ -177,6 +206,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="发现敏感文件时以非零退出码返回（用于 CI）",
     )
+    add_audit_args(p_check)
+    add_policy_arg(p_check)
 
     p_hook = sub.add_parser("git-hook", help="Git hooks 集成管理")
     hook_sub = p_hook.add_subparsers(dest="hook_action", required=True, metavar="ACTION")
@@ -188,6 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="敏感文件模式配置文件（类.gitignore 语法）",
     )
     p_install.add_argument("-k", "--key-file", help="使用密钥文件（推荐，避免 CI 交互）")
+    p_install.add_argument("--policy-file", default=".cryptpolicy", help="策略配置文件")
     p_install.add_argument("-f", "--force", action="store_true", help="覆盖已存在的 hook")
     p_uninstall = hook_sub.add_parser("uninstall", help="卸载 pre-commit hook")
     p_uninstall.add_argument("--hook-path", default=".git/hooks/pre-commit", help="hook 文件路径")
@@ -195,6 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--hook-path", default=".git/hooks/pre-commit", help="hook 文件路径")
     p_precommit = hook_sub.add_parser("_precommit", help=argparse.SUPPRESS)
     p_precommit.add_argument("--patterns-file", default=".cryptignore")
+    p_precommit.add_argument("--policy-file", default=".cryptpolicy")
     p_precommit.add_argument("-k", "--key-file", default=None)
 
     p_list = sub.add_parser("list", help="列出目录内匹配的配置/加密文件")
@@ -253,6 +286,12 @@ def cmd_encrypt_dir(args) -> int:
         env_key=args.env_key,
         need_confirm=True,
     )
+    try:
+        policy = load_policy(args.policy_file, base_dir=args.directory)
+    except PolicyError as e:
+        print(f"警告: {e}", file=sys.stderr)
+        policy = None
+
     if mode == "keyfile":
         results = encrypt_directory_bulk(
             args.directory,
@@ -261,6 +300,7 @@ def cmd_encrypt_dir(args) -> int:
             recursive=not args.no_recursive,
             config_only=not args.all_files,
             force=args.force,
+            policy=policy,
         )
     else:
         results = encrypt_directory_bulk(
@@ -270,6 +310,7 @@ def cmd_encrypt_dir(args) -> int:
             recursive=not args.no_recursive,
             config_only=not args.all_files,
             force=args.force,
+            policy=policy,
         )
     return print_results_enc(results)
 
@@ -354,37 +395,78 @@ def cmd_verify(args) -> int:
         env_key=args.env_key,
         need_confirm=False,
     )
+    try:
+        policy_base = args.path if os.path.isdir(args.path) else os.path.dirname(args.path) or "."
+        policy = load_policy(args.policy_file, base_dir=policy_base)
+    except PolicyError as e:
+        print(f"警告: {e}", file=sys.stderr)
+        policy = None
 
     if os.path.isdir(args.path):
+        scan_root = args.path
+        report = create_report(
+            command="verify",
+            scan_root=scan_root,
+            policy_file=policy.source_file if policy else None,
+        )
         if mode == "keyfile":
             results = verify_directory_bulk(
-                args.path, key=key_or_pwd, recursive=not args.no_recursive
+                args.path, key=key_or_pwd, recursive=not args.no_recursive, policy=policy
             )
         else:
             results = verify_directory_bulk(
-                args.path, password=key_or_pwd, recursive=not args.no_recursive
+                args.path, password=key_or_pwd, recursive=not args.no_recursive, policy=policy
             )
         total = len(results)
         ok = sum(1 for r in results if r.success)
         fail = total - ok
         for r in results:
+            rel = os.path.relpath(r.source, scan_root)
             if r.success:
                 print(f"  ✓ {r.source}")
+                report.add_file(AuditFileItem(
+                    path=r.source, rel_path=rel, status="passed", reason="校验通过",
+                ))
             else:
                 print(f"  ✗ {r.source}: {r.error}", file=sys.stderr)
+                report.add_file(AuditFileItem(
+                    path=r.source, rel_path=rel, status="failed", reason=str(r.error),
+                ))
         print(f"\n校验完成: 通过 {ok}，失败 {fail}，共 {total} 个")
+        report.mark_completed()
+        if args.report:
+            write_report(report, args.report, format=args.report_format)
+            print(f"\n审计报告已写入: {args.report}")
         return 0 if fail == 0 else 1
     else:
+        scan_root = os.path.dirname(args.path) or "."
+        report = create_report(
+            command="verify",
+            scan_root=scan_root,
+            policy_file=policy.source_file if policy else None,
+        )
         if mode == "keyfile":
             r = verify_file(args.path, key=key_or_pwd)
         else:
             r = verify_file(args.path, password=key_or_pwd)
+        rel = os.path.basename(args.path)
         if r.success:
             print(f"  ✓ {r.source}: 校验通过")
-            return 0
+            report.add_file(AuditFileItem(
+                path=r.source, rel_path=rel, status="passed", reason="校验通过",
+            ))
+            rc = 0
         else:
             print(f"  ✗ {r.source}: {r.error}", file=sys.stderr)
-            return 1
+            report.add_file(AuditFileItem(
+                path=r.source, rel_path=rel, status="failed", reason=str(r.error),
+            ))
+            rc = 1
+        report.mark_completed()
+        if args.report:
+            write_report(report, args.report, format=args.report_format)
+            print(f"\n审计报告已写入: {args.report}")
+        return rc
 
 
 def cmd_rekey(args) -> int:
@@ -401,81 +483,180 @@ def cmd_rekey(args) -> int:
         need_confirm=True,
     )
 
+    try:
+        policy_base = args.path if os.path.isdir(args.path) else os.path.dirname(args.path) or "."
+        policy = load_policy(args.policy_file, base_dir=policy_base)
+    except PolicyError as e:
+        print(f"警告: {e}", file=sys.stderr)
+        policy = None
+
     old_kwargs = {"old_key": old_val} if old_mode == "keyfile" else {"old_password": old_val}
     new_kwargs = {"new_key": new_val} if new_mode == "keyfile" else {"new_password": new_val}
     kwargs = {**old_kwargs, **new_kwargs}
 
+    dry_run = getattr(args, "dry_run", False)
+    backup = getattr(args, "backup", False)
+
+    if dry_run:
+        print("(DRY RUN) 以下文件将被迁移（不实际执行）:")
+
     if os.path.isdir(args.path):
         results = rekey_directory_bulk(
-            args.path, recursive=not args.no_recursive, **kwargs
+            args.path,
+            recursive=not args.no_recursive,
+            dry_run=dry_run,
+            backup=backup,
+            policy=policy,
+            **kwargs,
         )
         total = len(results)
         ok = sum(1 for r in results if r.success)
         fail = total - ok
         for r in results:
+            prefix = "(DRY RUN) " if dry_run else ""
             if r.success:
-                print(f"  ✓ {r.source}: 已更换密钥")
+                msg = "将迁移" if dry_run else "已更换密钥"
+                if r.backup:
+                    msg += f" (备份: {os.path.basename(r.backup)})"
+                print(f"  ✓ {prefix}{r.source}: {msg}")
             else:
-                print(f"  ✗ {r.source}: {r.error}", file=sys.stderr)
+                msg = "将失败" if dry_run else r.error
+                print(f"  ✗ {prefix}{r.source}: {msg}", file=sys.stderr)
+        if dry_run:
+            print(f"\n预计: 成功 {ok}，失败 {fail}，共 {total} 个")
+            return 0
         print(f"\n更换完成: 成功 {ok}，失败 {fail}，共 {total} 个")
+        if backup and fail == 0:
+            print("提示: 备份文件 (.bak) 已创建，确认无误后可手动删除")
+        elif fail > 0:
+            print("提示: 失败的文件保留原状态，成功的文件如有备份可用于恢复", file=sys.stderr)
         return 0 if fail == 0 else 1
     else:
-        r = rekey_file(args.path, **kwargs)
+        r = rekey_file(args.path, dry_run=dry_run, backup=backup, **kwargs)
+        prefix = "(DRY RUN) " if dry_run else ""
         if r.success:
-            print(f"  ✓ {r.source}: 已更换密钥")
+            msg = "将迁移" if dry_run else "已更换密钥"
+            if r.backup:
+                msg += f" (备份: {os.path.basename(r.backup)})"
+            print(f"  ✓ {prefix}{r.source}: {msg}")
             return 0
         else:
-            print(f"  ✗ {r.source}: {r.error}", file=sys.stderr)
+            msg = "将失败" if dry_run else r.error
+            print(f"  ✗ {prefix}{r.source}: {msg}", file=sys.stderr)
             return 1
 
 
 def cmd_check(args) -> int:
+    report = None
     try:
         if args.staged:
             root = find_git_root(args.path)
+            scan_root = root
+            try:
+                policy = load_policy(args.policy_file, base_dir=root)
+            except PolicyError as e:
+                print(f"警告: {e}", file=sys.stderr)
+                policy = None
             files = get_staged_files(root)
             patterns = (
                 load_patterns(os.path.join(root, args.patterns_file))
                 if os.path.exists(os.path.join(root, args.patterns_file))
                 else []
             )
-            sensitive = match_sensitive_files(files, patterns, root)
+            sensitive = match_sensitive_files(files, patterns, root, policy=policy)
             sensitive_display = [os.path.relpath(f, root) for f in sensitive]
+            all_files_display = [os.path.relpath(f, root) for f in files]
         else:
             if os.path.isfile(args.path):
+                scan_root = os.path.dirname(args.path) or "."
                 files_to_check = [args.path]
             else:
+                scan_root = args.path
                 files_to_check = collect_files(
                     args.path,
                     recursive=not args.no_recursive,
                     config_only=False,
                     include_encrypted=False,
                 )
+            try:
+                policy = load_policy(args.policy_file, base_dir=scan_root)
+            except PolicyError as e:
+                print(f"警告: {e}", file=sys.stderr)
+                policy = None
             patterns = (
                 load_patterns(args.patterns_file)
                 if os.path.exists(args.patterns_file)
                 else []
             )
-            sensitive = match_sensitive_files_local(files_to_check, patterns)
-            root_display = args.path if os.path.isdir(args.path) else os.path.dirname(args.path) or "."
+            sensitive = match_sensitive_files_local(
+                files_to_check, patterns, base_dir=scan_root, policy=policy
+            )
+            root_display = scan_root
             sensitive_display = []
             for f in sensitive:
                 try:
                     sensitive_display.append(os.path.relpath(f, root_display))
                 except ValueError:
                     sensitive_display.append(f)
+            all_files_display = []
+            for f in files_to_check:
+                try:
+                    all_files_display.append(os.path.relpath(f, root_display))
+                except ValueError:
+                    all_files_display.append(f)
+
+        report = create_report(
+            command="check",
+            scan_root=scan_root,
+            policy_file=policy.source_file if policy else None,
+        )
+        report.extra["staged"] = args.staged
+        report.extra["scanned_files"] = len(files_to_check) if not args.staged else len(files)
+
+        for disp, full in zip(sensitive_display, sensitive):
+            report.add_file(AuditFileItem(
+                path=full,
+                rel_path=disp,
+                status="failed",
+                reason="明文敏感文件，需加密",
+            ))
+
+        if args.staged:
+            for full, disp in zip(files, all_files_display):
+                if full not in sensitive:
+                    try:
+                        rel = os.path.relpath(full, root).replace("\\", "/")
+                    except ValueError:
+                        rel = disp
+                    reason = "已加密" if full.endswith(DEFAULT_EXT) else "非敏感文件"
+                    status = "passed" if full.endswith(DEFAULT_EXT) or not policy or not policy.is_required(rel) else "failed"
+                    if status == "passed":
+                        report.add_file(AuditFileItem(
+                            path=full, rel_path=disp, status="passed", reason=reason,
+                        ))
+
     except (FileHandlerError, GitHookError) as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1
 
+    if report:
+        report.mark_completed()
+
     if not sensitive_display:
         print("未发现明文敏感文件 ✓")
+        if args.report and report:
+            write_report(report, args.report, format=args.report_format)
+            print(f"\n审计报告已写入: {args.report}")
         return 0
 
     print(f"发现 {len(sensitive_display)} 个明文敏感文件（需先加密后再提交）:")
     for f in sensitive_display:
         print(f"  ⚠  {f}")
     print(f"\n提示: 使用 config-crypt encrypt <file> 加密，或 config-crypt git-hook install 自动处理")
+
+    if args.report and report:
+        write_report(report, args.report, format=args.report_format)
+        print(f"\n审计报告已写入: {args.report}")
 
     return 1 if args.fail else 0
 
@@ -487,6 +668,7 @@ def cmd_git_hook(args) -> int:
                 hook_path=args.hook_path,
                 patterns_file=args.patterns_file,
                 key_file=args.key_file,
+                policy_file=getattr(args, "policy_file", ".cryptpolicy"),
                 force=args.force,
             )
             print(f"已安装 git pre-commit hook: {args.hook_path}")
@@ -519,6 +701,7 @@ def cmd_git_hook(args) -> int:
         return githooks.precommit_hook_impl(
             patterns_file=args.patterns_file,
             key_file=args.key_file,
+            policy_file=getattr(args, "policy_file", ".cryptpolicy"),
         )
     return 1
 

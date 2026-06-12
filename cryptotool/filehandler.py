@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 import tarfile
 import json
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from .crypto import (
     verify_with_password,
     CryptoError,
 )
+from .policy import Policy
 
 
 DEFAULT_EXT = ".ccrypt"
@@ -105,6 +107,7 @@ def verify_directory_bulk(
     password: Optional[str] = None,
     key: Optional[bytes] = None,
     recursive: bool = True,
+    policy: Optional[Policy] = None,
 ) -> List[VerifyResult]:
     root = Path(dir_path)
     if not root.exists() or not root.is_dir():
@@ -112,6 +115,19 @@ def verify_directory_bulk(
 
     pattern = "**/*" + DEFAULT_EXT if recursive else "*" + DEFAULT_EXT
     files = [str(p) for p in root.glob(pattern) if p.is_file()]
+
+    if policy:
+        filtered = []
+        for f in files:
+            try:
+                rel = os.path.relpath(f, dir_path).replace("\\", "/")
+            except ValueError:
+                rel = os.path.basename(f)
+            if policy.should_ignore(rel):
+                continue
+            filtered.append(f)
+        files = filtered
+
     files.sort()
 
     results = []
@@ -146,10 +162,24 @@ def is_sensitive_file(path: str) -> bool:
 def match_sensitive_files_local(
     files: List[str],
     patterns: Optional[List] = None,
+    base_dir: Optional[str] = None,
+    policy: Optional[Policy] = None,
 ) -> List[str]:
     matched = []
+    root = base_dir or os.getcwd()
     for f in files:
         if f.endswith(DEFAULT_EXT):
+            continue
+        try:
+            rel = os.path.relpath(f, root).replace("\\", "/")
+        except ValueError:
+            rel = os.path.basename(f)
+        if policy and policy.should_ignore(rel):
+            continue
+        if policy and policy.is_allowed_plaintext(rel):
+            continue
+        if policy and policy.is_required(rel):
+            matched.append(f)
             continue
         if patterns and any(p.match(os.path.basename(f)) or p.match(f.replace("\\", "/")) for p in patterns):
             matched.append(f)
@@ -276,13 +306,18 @@ def encrypt_directory_bulk(
     recursive: bool = True,
     config_only: bool = True,
     force: bool = False,
+    policy: Optional[Policy] = None,
 ) -> List[EncryptResult]:
     files = collect_files(dir_path, recursive=recursive, config_only=config_only)
     results = []
     out_root = Path(output_dir) if output_dir else Path(dir_path)
 
     for f in files:
-        rel = os.path.relpath(f, dir_path)
+        rel = os.path.relpath(f, dir_path).replace("\\", "/")
+        if policy and policy.should_ignore(rel):
+            continue
+        if policy and policy.is_allowed_plaintext(rel):
+            continue
         target = str(out_root / (rel + DEFAULT_EXT))
         results.append(
             encrypt_file(
@@ -429,6 +464,8 @@ class RekeyResult:
     source: str
     success: bool
     error: Optional[str] = None
+    dry_run: bool = False
+    backup: Optional[str] = None
 
 
 def rekey_file(
@@ -438,6 +475,8 @@ def rekey_file(
     old_key: Optional[bytes] = None,
     new_password: Optional[str] = None,
     new_key: Optional[bytes] = None,
+    dry_run: bool = False,
+    backup: bool = False,
 ) -> RekeyResult:
     if not (old_password is not None or old_key is not None):
         return RekeyResult(
@@ -448,6 +487,18 @@ def rekey_file(
             source=input_path, success=False, error="必须提供新密码或新密钥"
         )
 
+    if dry_run:
+        try:
+            ciphertext_old = read_file(input_path)
+            if old_key is not None:
+                decrypt_data(ciphertext_old, old_key)
+            else:
+                decrypt_with_password(ciphertext_old, old_password)
+            return RekeyResult(source=input_path, success=True, dry_run=True)
+        except (CryptoError, FileHandlerError) as e:
+            return RekeyResult(source=input_path, success=False, error=str(e), dry_run=True)
+
+    backup_path = None
     try:
         ciphertext_old = read_file(input_path)
 
@@ -455,6 +506,10 @@ def rekey_file(
             plaintext = decrypt_data(ciphertext_old, old_key)
         else:
             plaintext = decrypt_with_password(ciphertext_old, old_password)
+
+        if backup:
+            backup_path = input_path + ".bak"
+            shutil.copy2(input_path, backup_path)
 
         if new_key is not None:
             ciphertext_new = encrypt_data(plaintext, new_key)
@@ -466,6 +521,8 @@ def rekey_file(
             f.write(ciphertext_new)
         os.replace(tmp_path, input_path)
 
+        if backup_path:
+            return RekeyResult(source=input_path, success=True, backup=backup_path)
         return RekeyResult(source=input_path, success=True)
     except (CryptoError, FileHandlerError, OSError) as e:
         try:
@@ -475,7 +532,7 @@ def rekey_file(
         except OSError:
             pass
         return RekeyResult(
-            source=input_path, success=False, error=str(e)
+            source=input_path, success=False, error=str(e), backup=backup_path
         )
 
 
@@ -487,6 +544,9 @@ def rekey_directory_bulk(
     new_password: Optional[str] = None,
     new_key: Optional[bytes] = None,
     recursive: bool = True,
+    dry_run: bool = False,
+    backup: bool = False,
+    policy: Optional[Policy] = None,
 ) -> List[RekeyResult]:
     root = Path(dir_path)
     if not root.exists() or not root.is_dir():
@@ -494,6 +554,19 @@ def rekey_directory_bulk(
 
     pattern = "**/*" + DEFAULT_EXT if recursive else "*" + DEFAULT_EXT
     files = [str(p) for p in root.glob(pattern) if p.is_file()]
+
+    if policy:
+        filtered = []
+        for f in files:
+            try:
+                rel = os.path.relpath(f, dir_path).replace("\\", "/")
+            except ValueError:
+                rel = os.path.basename(f)
+            if policy.should_ignore(rel):
+                continue
+            filtered.append(f)
+        files = filtered
+
     files.sort()
 
     results = []
@@ -505,6 +578,8 @@ def rekey_directory_bulk(
                 old_key=old_key,
                 new_password=new_password,
                 new_key=new_key,
+                dry_run=dry_run,
+                backup=backup,
             )
         )
     return results

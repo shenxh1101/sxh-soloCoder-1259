@@ -42,6 +42,9 @@ from cryptotool.keymanager import (
     read_key_file,
     KEY_SIZE,
 )
+from cryptotool.policy import load_policy, Policy
+from cryptotool.audit import create_report, write_report, AuditReport, AuditFileItem
+from cryptotool import githooks
 
 
 class TestCrypto(unittest.TestCase):
@@ -521,6 +524,343 @@ class TestCLI(unittest.TestCase):
         p2 = os.path.join(self.tmpdir, "plain.txt")
         with open(p2, "w") as fh: fh.write("ok\n")
         self.assertEqual(self._run(["check", p2, "--fail"]), 0)
+
+    def test_verify_report_json(self):
+        f = os.path.join(self.tmpdir, "v.env")
+        with open(f, "w") as fh: fh.write("x=1\n")
+        self.assertEqual(self._run(["encrypt", f, "-p", "pw"]), 0)
+        enc = f + DEFAULT_EXT
+        report = os.path.join(self.tmpdir, "verify.json")
+        self.assertEqual(self._run(["verify", enc, "-p", "pw", "--report", report]), 0)
+        self.assertTrue(os.path.exists(report))
+        import json
+        with open(report, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["summary"]["passed"], 1)
+        self.assertEqual(data["command"], "verify")
+
+    def test_verify_report_markdown(self):
+        f = os.path.join(self.tmpdir, "v.env")
+        with open(f, "w") as fh: fh.write("x=1\n")
+        self.assertEqual(self._run(["encrypt", f, "-p", "pw"]), 0)
+        enc = f + DEFAULT_EXT
+        report = os.path.join(self.tmpdir, "verify.md")
+        self.assertEqual(self._run(["verify", enc, "-p", "pw", "--report", report, "--report-format", "markdown"]), 0)
+        self.assertTrue(os.path.exists(report))
+        with open(report, encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertIn("# config-crypt 审计报告", content)
+        self.assertIn("汇总", content)
+
+    def test_check_report_json(self):
+        f = os.path.join(self.tmpdir, ".env")
+        with open(f, "w") as fh: fh.write("x=1\n")
+        report = os.path.join(self.tmpdir, "check.json")
+        self.assertEqual(self._run(["check", self.tmpdir, "--report", report]), 0)
+        self.assertTrue(os.path.exists(report))
+        import json
+        with open(report, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertGreaterEqual(data["summary"]["failed"], 1)
+
+    def test_rekey_dry_run(self):
+        f = os.path.join(self.tmpdir, "r.env")
+        with open(f, "w") as fh: fh.write("data\n")
+        self.assertEqual(self._run(["encrypt", f, "-p", "old"]), 0)
+        enc = f + DEFAULT_EXT
+        orig_mtime = os.path.getmtime(enc)
+        import time
+        time.sleep(0.1)
+        rc = self._run(["rekey", enc, "--old-password", "old", "--new-password", "new", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(os.path.getmtime(enc), orig_mtime, "dry-run should not modify file")
+        self.assertEqual(self._run(["verify", enc, "-p", "old"]), 0)
+
+    def test_rekey_with_backup(self):
+        f = os.path.join(self.tmpdir, "r.env")
+        with open(f, "w") as fh: fh.write("data\n")
+        self.assertEqual(self._run(["encrypt", f, "-p", "old"]), 0)
+        enc = f + DEFAULT_EXT
+        rc = self._run(["rekey", enc, "--old-password", "old", "--new-password", "new", "--backup"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(enc + ".bak"), "backup should exist")
+        self.assertEqual(self._run(["verify", enc, "-p", "new"]), 0)
+        os.replace(enc + ".bak", enc)
+        self.assertEqual(self._run(["verify", enc, "-p", "old"]), 0)
+
+    def test_encrypt_dir_with_policy(self):
+        policy_file = os.path.join(self.tmpdir, ".cryptpolicy")
+        with open(policy_file, "w") as fh:
+            fh.write("""[policy]
+required =
+    .env*
+    **/*.yaml
+allowed_plaintext =
+    .env.example
+ignore_extensions = .txt
+""")
+        env = os.path.join(self.tmpdir, ".env")
+        env_example = os.path.join(self.tmpdir, ".env.example")
+        yaml = os.path.join(self.tmpdir, "cfg.yaml")
+        txt = os.path.join(self.tmpdir, "notes.txt")
+        for p in [env, env_example, yaml, txt]:
+            with open(p, "w") as fh: fh.write("data\n")
+        rc = self._run(["encrypt-dir", self.tmpdir, "-p", "pw", "-f", "--policy-file", policy_file])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(env + DEFAULT_EXT), ".env should be encrypted")
+        self.assertFalse(os.path.exists(env_example + DEFAULT_EXT), ".env.example should NOT be encrypted")
+        self.assertTrue(os.path.exists(yaml + DEFAULT_EXT), "yaml should be encrypted")
+        self.assertFalse(os.path.exists(txt + DEFAULT_EXT), ".txt should be ignored")
+
+
+class TestPolicy(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_load_default_policy(self):
+        policy = load_policy(base_dir=self.tmpdir)
+        self.assertIsNone(policy.source_file)
+        self.assertTrue(policy.is_required(".env"))
+        self.assertTrue(policy.is_required("config/prod.yaml"))
+        self.assertTrue(policy.is_required("server.pem"))
+
+    def test_load_policy_from_file(self):
+        policy_file = os.path.join(self.tmpdir, ".cryptpolicy")
+        with open(policy_file, "w") as f:
+            f.write("""[policy]
+required =
+    .env*
+    secrets/**/*
+allowed_plaintext =
+    .env.example
+ignore_extensions = .md, .txt
+ignore_patterns =
+    docs/**
+""")
+        policy = load_policy(policy_file, base_dir=self.tmpdir)
+        self.assertEqual(policy.source_file, policy_file)
+        self.assertTrue(policy.is_required(".env"))
+        self.assertTrue(policy.is_required("secrets/id_rsa"))
+        self.assertFalse(policy.is_required(".env.example"))
+        self.assertTrue(policy.is_allowed_plaintext(".env.example"))
+        self.assertTrue(policy.should_ignore("README.md"))
+        self.assertTrue(policy.should_ignore("docs/notes.md"))
+
+    def test_policy_ignore_extensions(self):
+        policy = Policy()
+        policy.ignore_extensions.add(".md")
+        self.assertTrue(policy.should_ignore("readme.md"))
+        self.assertFalse(policy.is_required("readme.md"))
+
+    def test_policy_allowed_plaintext(self):
+        policy_file = os.path.join(self.tmpdir, ".cryptpolicy")
+        with open(policy_file, "w") as f:
+            f.write("""[policy]
+allowed_plaintext =
+    .env.example
+""")
+        policy = load_policy(policy_file, base_dir=self.tmpdir)
+        self.assertTrue(policy.is_allowed_plaintext(".env.example"))
+        self.assertFalse(policy.is_allowed_plaintext(".env"))
+
+
+class TestAudit(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_create_report(self):
+        report = create_report("check", self.tmpdir)
+        self.assertEqual(report.command, "check")
+        self.assertEqual(report.scan_root, self.tmpdir)
+        self.assertIsNotNone(report.started_at)
+
+    def test_add_file_to_report(self):
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(
+            path="/a/.env", rel_path=".env", status="failed", reason="需加密",
+        ))
+        report.add_file(AuditFileItem(
+            path="/a/code.py", rel_path="code.py", status="passed", reason="非敏感",
+        ))
+        self.assertEqual(report.total_files, 2)
+        self.assertEqual(report.passed, 1)
+        self.assertEqual(report.failed, 1)
+
+    def test_report_to_json(self):
+        report = create_report("verify", self.tmpdir)
+        report.add_file(AuditFileItem(
+            path="/a.env.ccrypt", rel_path="a.env.ccrypt", status="passed", reason="通过",
+        ))
+        report.mark_completed()
+        import json
+        data = json.loads(report.to_json())
+        self.assertEqual(data["command"], "verify")
+        self.assertEqual(data["summary"]["passed"], 1)
+
+    def test_report_to_markdown(self):
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(
+            path="/a/.env", rel_path=".env", status="failed", reason="需加密",
+        ))
+        report.mark_completed()
+        md = report.to_markdown()
+        self.assertIn("# config-crypt 审计报告", md)
+        self.assertIn("汇总", md)
+        self.assertIn(".env", md)
+
+    def test_write_report_json(self):
+        import json
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(
+            path="/a/.env", rel_path=".env", status="failed", reason="需加密",
+        ))
+        report.mark_completed()
+        out = os.path.join(self.tmpdir, "rep.json")
+        write_report(report, out)
+        self.assertTrue(os.path.exists(out))
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["command"], "check")
+
+    def test_write_report_markdown(self):
+        report = create_report("check", self.tmpdir)
+        report.mark_completed()
+        out = os.path.join(self.tmpdir, "rep.md")
+        write_report(report, out, format="markdown")
+        self.assertTrue(os.path.exists(out))
+        with open(out, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("# config-crypt 审计报告", content)
+
+
+class TestRekeyFeatures(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_rekey_file_dry_run_does_not_modify(self):
+        f = os.path.join(self.tmpdir, "test.env")
+        with open(f, "w") as fh: fh.write("data\n")
+        encrypt_file(f, password="old")
+        enc = f + DEFAULT_EXT
+        os.unlink(f)
+        with open(enc, "rb") as fh:
+            before = fh.read()
+        result = rekey_file(enc, old_password="old", new_password="new", dry_run=True)
+        self.assertTrue(result.success)
+        self.assertTrue(result.dry_run)
+        with open(enc, "rb") as fh:
+            after = fh.read()
+        self.assertEqual(before, after, "dry-run must not modify file")
+
+    def test_rekey_file_with_backup(self):
+        f = os.path.join(self.tmpdir, "test.env")
+        with open(f, "w") as fh: fh.write("data\n")
+        encrypt_file(f, password="old")
+        enc = f + DEFAULT_EXT
+        os.unlink(f)
+        result = rekey_file(enc, old_password="old", new_password="new", backup=True)
+        self.assertTrue(result.success)
+        self.assertEqual(result.backup, enc + ".bak")
+        self.assertTrue(os.path.exists(result.backup))
+        self.assertTrue(verify_file(enc, password="new").success)
+        os.replace(enc + ".bak", enc)
+        self.assertTrue(verify_file(enc, password="old").success)
+
+    def test_rekey_directory_bulk_dry_run(self):
+        for name in ["a.env", "b.yaml"]:
+            p = os.path.join(self.tmpdir, name)
+            with open(p, "w") as fh: fh.write("x\n")
+            encrypt_file(p, password="old")
+            os.unlink(p)
+        results = rekey_directory_bulk(
+            self.tmpdir, old_password="old", new_password="new", dry_run=True
+        )
+        self.assertEqual(len(results), 2)
+        for r in results:
+            self.assertTrue(r.dry_run)
+            self.assertTrue(r.success)
+        for name in ["a.env.ccrypt", "b.yaml.ccrypt"]:
+            p = os.path.join(self.tmpdir, name)
+            self.assertTrue(verify_file(p, password="old").success)
+
+    def test_rekey_directory_bulk_with_backup(self):
+        for name in ["a.env", "b.yaml"]:
+            p = os.path.join(self.tmpdir, name)
+            with open(p, "w") as fh: fh.write("x\n")
+            encrypt_file(p, password="old")
+            os.unlink(p)
+        results = rekey_directory_bulk(
+            self.tmpdir, old_password="old", new_password="new", backup=True
+        )
+        self.assertEqual(len(results), 2)
+        for r in results:
+            self.assertIsNotNone(r.backup)
+            self.assertTrue(os.path.exists(r.backup))
+
+
+class TestGitHookWithKey(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        import subprocess
+        subprocess.run(["git", "init", self.tmpdir], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=self.tmpdir, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=self.tmpdir, capture_output=True
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_generate_hook_script_with_absolute_key(self):
+        key_file = os.path.join(self.tmpdir, "my.key")
+        write_key_file(key_file, force=True)
+        script = githooks.generate_hook_script(key_file=key_file)
+        abs_key = os.path.abspath(key_file)
+        self.assertIn(repr(abs_key).strip("'"), script)
+
+    def test_generate_hook_script_with_relative_key(self):
+        rel_key = "my.key"
+        key_file = os.path.join(self.tmpdir, rel_key)
+        write_key_file(key_file, force=True)
+        script = githooks.generate_hook_script(key_file=rel_key)
+        abs_key = os.path.abspath(rel_key)
+        self.assertIn(repr(abs_key).strip("'"), script)
+
+    def test_install_hook_with_key(self):
+        key_file = os.path.join(self.tmpdir, "my.key")
+        write_key_file(key_file, force=True)
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmpdir)
+            githooks.install_hook(key_file=key_file, force=True)
+            hook_path = os.path.join(self.tmpdir, ".git", "hooks", "pre-commit")
+            self.assertTrue(os.path.exists(hook_path))
+            with open(hook_path, encoding="utf-8") as f:
+                content = f.read()
+            abs_key = os.path.abspath(key_file)
+            self.assertTrue(
+                repr(abs_key).strip("'") in content or repr(abs_key) in content,
+                "key file path not found in hook script"
+            )
+        finally:
+            os.chdir(old_cwd)
+
+    def test_generate_hook_script_includes_policy_file(self):
+        script = githooks.generate_hook_script(policy_file=".cryptpolicy")
+        self.assertIn(".cryptpolicy", script)
 
 
 if __name__ == "__main__":
