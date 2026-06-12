@@ -2,7 +2,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from . import __version__
 from .crypto import CryptoError, PasswordError, TamperedError, VersionError
@@ -23,8 +23,9 @@ from .filehandler import (
     rekey_directory_bulk,
     match_sensitive_files_local,
 )
-from .policy import Policy, PolicyError, load_policy
-from .audit import AuditFileItem, AuditReport, create_report, write_report
+from .policy import Policy, PolicyError, load_policy, init_policy_file, generate_policy_template
+from .audit import AuditFileItem, AuditReport, create_report, write_report, filter_report_by_new, load_report
+from .secretscan import ScanConfig, scan_file, scan_directory, load_allowlist_from_file
 from . import githooks
 from .githooks import (
     get_staged_files,
@@ -83,9 +84,13 @@ def add_audit_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--report-format",
-        choices=["json", "markdown", "md"],
+        choices=["json", "markdown", "md", "sarif"],
         default=None,
-        help="报告格式（默认根据扩展名自动识别）",
+        help="报告格式：json / markdown(md) / sarif（默认根据扩展名自动识别）",
+    )
+    parser.add_argument(
+        "--diff-with",
+        help="与之前的报告做 diff，只显示新增的问题（需提供之前的 json 报告路径）",
     )
 
 
@@ -234,6 +239,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("directory", default=".", nargs="?", help="目标目录")
     p_list.add_argument("--no-recursive", action="store_true", help="不递归子目录")
     p_list.add_argument("--encrypted", action="store_true", help="列出加密文件而非配置文件")
+
+    p_policy = sub.add_parser("policy", help="策略文件管理")
+    policy_sub = p_policy.add_subparsers(dest="policy_action", required=True, metavar="ACTION")
+    p_policy_init = policy_sub.add_parser("init", help="生成带注释的 .cryptpolicy 策略模板")
+    p_policy_init.add_argument("-o", "--output", default=".cryptpolicy", help="输出路径（默认 .cryptpolicy）")
+    p_policy_init.add_argument("-f", "--force", action="store_true", help="覆盖已存在的文件")
+    p_policy_explain = policy_sub.add_parser("explain", help="解释某个文件为什么被策略标记/豁免/忽略")
+    p_policy_explain.add_argument("file", help="要分析的文件路径")
+    p_policy_explain.add_argument("--base-dir", default=".", help="相对路径基准目录（默认当前目录）")
+    add_policy_arg(p_policy_explain)
+
+    p_sscan = sub.add_parser("secret-scan", help="扫描文件内容中的密钥、token、私钥等敏感信息")
+    p_sscan.add_argument("path", nargs="?", default=".", help="文件或目录路径（默认当前目录）")
+    p_sscan.add_argument("--no-recursive", action="store_true", help="不递归子目录")
+    p_sscan.add_argument(
+        "--allowlist-file",
+        default=".cryptallowlist",
+        help="白名单文件路径，每行一个允许字符串（匹配行内任意位置）",
+    )
+    p_sscan.add_argument(
+        "--fail",
+        action="store_true",
+        help="发现敏感信息时以非零退出码返回（用于 CI）",
+    )
+    add_audit_args(p_sscan)
 
     return parser
 
@@ -435,6 +465,7 @@ def cmd_verify(args) -> int:
         print(f"\n校验完成: 通过 {ok}，失败 {fail}，共 {total} 个")
         report.mark_completed()
         if args.report:
+            report = _apply_report_diff(report, getattr(args, "diff_with", None))
             write_report(report, args.report, format=args.report_format)
             print(f"\n审计报告已写入: {args.report}")
         return 0 if fail == 0 else 1
@@ -464,6 +495,7 @@ def cmd_verify(args) -> int:
             rc = 1
         report.mark_completed()
         if args.report:
+            report = _apply_report_diff(report, getattr(args, "diff_with", None))
             write_report(report, args.report, format=args.report_format)
             print(f"\n审计报告已写入: {args.report}")
         return rc
@@ -613,6 +645,8 @@ def cmd_check(args) -> int:
         report.extra["staged"] = args.staged
         report.extra["scanned_files"] = len(files_to_check) if not args.staged else len(files)
 
+        sensitive_set = set(sensitive)
+
         for disp, full in zip(sensitive_display, sensitive):
             report.add_file(AuditFileItem(
                 path=full,
@@ -623,17 +657,34 @@ def cmd_check(args) -> int:
 
         if args.staged:
             for full, disp in zip(files, all_files_display):
-                if full not in sensitive:
+                if full not in sensitive_set:
                     try:
                         rel = os.path.relpath(full, root).replace("\\", "/")
                     except ValueError:
                         rel = disp
                     reason = "已加密" if full.endswith(DEFAULT_EXT) else "非敏感文件"
-                    status = "passed" if full.endswith(DEFAULT_EXT) or not policy or not policy.is_required(rel) else "failed"
-                    if status == "passed":
-                        report.add_file(AuditFileItem(
-                            path=full, rel_path=disp, status="passed", reason=reason,
-                        ))
+                    report.add_file(AuditFileItem(
+                        path=full, rel_path=disp, status="passed", reason=reason,
+                    ))
+        else:
+            for full, disp in zip(files_to_check, all_files_display):
+                if full in sensitive_set:
+                    continue
+                try:
+                    rel = os.path.relpath(full, scan_root).replace("\\", "/")
+                except ValueError:
+                    rel = disp
+                if full.endswith(DEFAULT_EXT):
+                    reason = "已加密"
+                elif policy and policy.should_ignore(rel):
+                    reason = "忽略（ignore_extensions/ignore_patterns）"
+                elif policy and policy.is_allowed_plaintext(rel):
+                    reason = "允许明文（allowed_plaintext）"
+                else:
+                    reason = "非敏感文件"
+                report.add_file(AuditFileItem(
+                    path=full, rel_path=disp, status="passed", reason=reason,
+                ))
 
     except (FileHandlerError, GitHookError) as e:
         print(f"错误: {e}", file=sys.stderr)
@@ -645,6 +696,7 @@ def cmd_check(args) -> int:
     if not sensitive_display:
         print("未发现明文敏感文件 ✓")
         if args.report and report:
+            report = _apply_report_diff(report, getattr(args, "diff_with", None))
             write_report(report, args.report, format=args.report_format)
             print(f"\n审计报告已写入: {args.report}")
         return 0
@@ -655,6 +707,7 @@ def cmd_check(args) -> int:
     print(f"\n提示: 使用 config-crypt encrypt <file> 加密，或 config-crypt git-hook install 自动处理")
 
     if args.report and report:
+        report = _apply_report_diff(report, getattr(args, "diff_with", None))
         write_report(report, args.report, format=args.report_format)
         print(f"\n审计报告已写入: {args.report}")
 
@@ -728,6 +781,125 @@ def cmd_list(args) -> int:
     return 0
 
 
+def _apply_report_diff(report: AuditReport, diff_path: Optional[str]) -> AuditReport:
+    if not diff_path:
+        return report
+    if not os.path.exists(diff_path):
+        print(f"警告: diff 报告不存在 {diff_path}，忽略 --diff-with", file=sys.stderr)
+        return report
+    try:
+        prev = load_report(diff_path)
+        return filter_report_by_new(report, prev)
+    except Exception as e:
+        print(f"警告: 读取 diff 报告失败: {e}", file=sys.stderr)
+        return report
+
+
+def cmd_policy(args) -> int:
+    if args.policy_action == "init":
+        try:
+            path = init_policy_file(args.output, force=args.force)
+            print(f"已生成策略模板: {path}")
+            print("提示: 编辑此文件以自定义团队加密规则")
+            return 0
+        except PolicyError as e:
+            print(f"错误: {e}", file=sys.stderr)
+            return 1
+    elif args.policy_action == "explain":
+        try:
+            policy = load_policy(args.policy_file, base_dir=args.base_dir)
+        except PolicyError as e:
+            print(f"警告: {e}", file=sys.stderr)
+            policy = load_policy(base_dir=args.base_dir)
+
+        if os.path.isabs(args.file):
+            rel_path = os.path.relpath(args.file, args.base_dir)
+        else:
+            rel_path = args.file
+        rel_path = rel_path.replace("\\", "/")
+
+        result = policy.explain(rel_path)
+        print(f"文件: {result['path']}")
+        if policy.source_file:
+            print(f"策略: {policy.source_file}")
+        else:
+            print("策略: 使用内置默认规则")
+        print()
+        if result["reasons"]:
+            print("匹配原因:")
+            for r in result["reasons"]:
+                print(f"  - {r}")
+        else:
+            print("匹配原因: 无匹配规则")
+        print()
+        print(f"最终结论: {result['final_verdict']}")
+        return 0
+    return 1
+
+
+def cmd_secret_scan(args) -> int:
+    allowlist = load_allowlist_from_file(args.allowlist_file)
+    config = ScanConfig(allowlist=allowlist)
+
+    if os.path.isfile(args.path):
+        scan_root = os.path.dirname(args.path) or "."
+        findings = scan_file(args.path, base_dir=scan_root, config=config)
+    else:
+        scan_root = args.path
+        findings = scan_directory(
+            args.path,
+            recursive=not args.no_recursive,
+            base_dir=scan_root,
+            config=config,
+        )
+
+    report = create_report(command="secret-scan", scan_root=scan_root)
+    report.extra["allowlist_file"] = args.allowlist_file
+    report.extra["scanned_with_allowlist"] = len(allowlist) > 0
+
+    if not findings:
+        print("未发现敏感信息 ✓")
+        report.add_file(AuditFileItem(
+            path=scan_root, rel_path=scan_root, status="passed", reason="无敏感信息",
+        ))
+        report.mark_completed()
+        if args.report:
+            report = _apply_report_diff(report, args.diff_with)
+            write_report(report, args.report, format=args.report_format)
+            print(f"\n审计报告已写入: {args.report}")
+        return 0
+
+    by_file: Dict[str, List] = {}
+    for f in findings:
+        by_file.setdefault(f.rel_path, []).append(f)
+        report.add_file(AuditFileItem(
+            path=f.file_path,
+            rel_path=f.rel_path,
+            status="failed",
+            reason=f"{f.description} (行 {f.line})",
+            details={"line": f.line, "type": f.secret_type},
+        ))
+
+    print(f"发现 {len(findings)} 处敏感信息，涉及 {len(by_file)} 个文件:")
+    for rel_path, items in by_file.items():
+        print(f"\n  ⚠  {rel_path}:")
+        for item in items:
+            preview = item.matched_text[:60]
+            if len(item.matched_text) > 60:
+                preview += "..."
+            print(f"    第 {item.line} 行 [{item.description}]: {preview}")
+
+    print(f"\n提示: 使用 --allowlist-file 添加白名单放过测试样例，或加密这些文件")
+
+    report.mark_completed()
+    if args.report:
+        report = _apply_report_diff(report, args.diff_with)
+        write_report(report, args.report, format=args.report_format)
+        print(f"\n审计报告已写入: {args.report}")
+
+    return 1 if args.fail else 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -745,6 +917,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "check": cmd_check,
         "git-hook": cmd_git_hook,
         "list": cmd_list,
+        "policy": cmd_policy,
+        "secret-scan": cmd_secret_scan,
     }
 
     try:

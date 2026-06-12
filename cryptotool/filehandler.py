@@ -308,16 +308,22 @@ def encrypt_directory_bulk(
     force: bool = False,
     policy: Optional[Policy] = None,
 ) -> List[EncryptResult]:
-    files = collect_files(dir_path, recursive=recursive, config_only=config_only)
+    if policy is not None:
+        files = collect_files(dir_path, recursive=recursive, config_only=False)
+    else:
+        files = collect_files(dir_path, recursive=recursive, config_only=config_only)
     results = []
     out_root = Path(output_dir) if output_dir else Path(dir_path)
 
     for f in files:
         rel = os.path.relpath(f, dir_path).replace("\\", "/")
-        if policy and policy.should_ignore(rel):
-            continue
-        if policy and policy.is_allowed_plaintext(rel):
-            continue
+        if policy is not None:
+            if policy.should_ignore(rel):
+                continue
+            if policy.is_allowed_plaintext(rel):
+                continue
+            if not policy.is_required(rel):
+                continue
         target = str(out_root / (rel + DEFAULT_EXT))
         results.append(
             encrypt_file(

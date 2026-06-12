@@ -42,9 +42,16 @@ from cryptotool.keymanager import (
     read_key_file,
     KEY_SIZE,
 )
-from cryptotool.policy import load_policy, Policy
-from cryptotool.audit import create_report, write_report, AuditReport, AuditFileItem
+from cryptotool.policy import load_policy, Policy, init_policy_file, generate_policy_template, PolicyError
+from cryptotool.audit import (
+    create_report, write_report, AuditReport, AuditFileItem,
+    load_report, diff_reports, filter_report_by_new,
+)
 from cryptotool import githooks
+from cryptotool.secretscan import (
+    scan_file, scan_directory, ScanConfig, SecretFinding,
+    load_allowlist_from_file, SECRET_PATTERNS, DEFAULT_ALLOWLIST,
+)
 
 
 class TestCrypto(unittest.TestCase):
@@ -861,6 +868,300 @@ class TestGitHookWithKey(unittest.TestCase):
     def test_generate_hook_script_includes_policy_file(self):
         script = githooks.generate_hook_script(policy_file=".cryptpolicy")
         self.assertIn(".cryptpolicy", script)
+
+
+class TestPolicyInit(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_generate_template_content(self):
+        tpl = generate_policy_template()
+        self.assertIn("[policy]", tpl)
+        self.assertIn("required", tpl)
+        self.assertIn("allowed_plaintext", tpl)
+        self.assertIn("ignore_extensions", tpl)
+
+    def test_init_policy_file(self):
+        out = os.path.join(self.tmpdir, ".cryptpolicy")
+        path = init_policy_file(out)
+        self.assertEqual(path, out)
+        self.assertTrue(os.path.exists(out))
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("required", f.read())
+
+    def test_init_policy_file_no_force_exists(self):
+        out = os.path.join(self.tmpdir, ".cryptpolicy")
+        init_policy_file(out)
+        with self.assertRaises(PolicyError):
+            init_policy_file(out, force=False)
+
+    def test_init_policy_file_force_overwrite(self):
+        out = os.path.join(self.tmpdir, ".cryptpolicy")
+        init_policy_file(out)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("old")
+        init_policy_file(out, force=True)
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("required", f.read())
+
+
+class TestPolicyExplain(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_explain_required(self):
+        policy = load_policy(base_dir=self.tmpdir)
+        r = policy.explain(".env")
+        self.assertTrue(r["is_required"])
+        self.assertIn("必须加密", r["final_verdict"])
+
+    def test_explain_allowed_plaintext(self):
+        pf = os.path.join(self.tmpdir, ".cryptpolicy")
+        with open(pf, "w") as f:
+            f.write("""[policy]
+allowed_plaintext =
+    .env.example
+""")
+        policy = load_policy(pf, base_dir=self.tmpdir)
+        r = policy.explain(".env.example")
+        self.assertTrue(r["is_allowed_plaintext"])
+        self.assertFalse(r["is_required"])
+        self.assertIn("允许明文", r["final_verdict"])
+
+    def test_explain_ignored(self):
+        pf = os.path.join(self.tmpdir, ".cryptpolicy")
+        with open(pf, "w") as f:
+            f.write("""[policy]
+ignore_extensions = .md
+""")
+        policy = load_policy(pf, base_dir=self.tmpdir)
+        r = policy.explain("README.md")
+        self.assertTrue(r["should_ignore"])
+        self.assertIn("忽略", r["final_verdict"])
+
+    def test_explain_non_sensitive(self):
+        pf = os.path.join(self.tmpdir, ".cryptpolicy")
+        with open(pf, "w") as f:
+            f.write("""[policy]
+required =
+    .env
+""")
+        policy = load_policy(pf, base_dir=self.tmpdir)
+        r = policy.explain("code.py")
+        self.assertFalse(r["is_required"])
+        self.assertIn("非敏感", r["final_verdict"])
+
+
+class TestSarifExport(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_report_to_sarif(self):
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(
+            path="/a/.env", rel_path=".env", status="failed", reason="需加密",
+        ))
+        report.mark_completed()
+        sarif = report.to_sarif()
+        self.assertEqual(sarif["version"], "2.1.0")
+        self.assertEqual(len(sarif["runs"]), 1)
+        run = sarif["runs"][0]
+        self.assertEqual(run["tool"]["driver"]["name"], "config-crypt")
+        self.assertEqual(len(run["results"]), 1)
+        self.assertEqual(run["results"][0]["ruleId"], "CC001")
+
+    def test_sarif_no_failed(self):
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(
+            path="/a/code.py", rel_path="code.py", status="passed",
+        ))
+        report.mark_completed()
+        sarif = report.to_sarif()
+        self.assertEqual(len(sarif["runs"][0]["results"]), 0)
+
+    def test_write_report_sarif(self):
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(
+            path="/a/.env", rel_path=".env", status="failed", reason="需加密",
+        ))
+        report.mark_completed()
+        out = os.path.join(self.tmpdir, "r.sarif")
+        write_report(report, out)
+        self.assertTrue(os.path.exists(out))
+        import json
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["version"], "2.1.0")
+
+
+class TestReportDiff(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_diff_reports(self):
+        r1 = create_report("check", self.tmpdir)
+        r1.add_file(AuditFileItem(path="a.env", rel_path="a.env", status="failed"))
+        r1.mark_completed()
+        r2 = create_report("check", self.tmpdir)
+        r2.add_file(AuditFileItem(path="a.env", rel_path="a.env", status="failed"))
+        r2.add_file(AuditFileItem(path="b.env", rel_path="b.env", status="failed"))
+        r2.mark_completed()
+        added, removed, unchanged = diff_reports(r2, r1)
+        self.assertEqual(added, {"b.env"})
+        self.assertEqual(removed, set())
+        self.assertEqual(unchanged, {"a.env"})
+
+    def test_filter_report_by_new(self):
+        r1 = create_report("check", self.tmpdir)
+        r1.add_file(AuditFileItem(path="a.env", rel_path="a.env", status="failed"))
+        r1.mark_completed()
+        r2 = create_report("check", self.tmpdir)
+        r2.add_file(AuditFileItem(path="a.env", rel_path="a.env", status="failed"))
+        r2.add_file(AuditFileItem(path="b.env", rel_path="b.env", status="failed"))
+        r2.mark_completed()
+        filtered = filter_report_by_new(r2, r1)
+        self.assertEqual(filtered.failed, 1)
+        self.assertEqual(filtered.total_files, 1)
+        self.assertEqual(filtered.files[0].rel_path, "b.env")
+
+    def test_load_report_from_json(self):
+        r1 = create_report("check", self.tmpdir)
+        r1.add_file(AuditFileItem(
+            path="/a/.env", rel_path=".env", status="failed", reason="x",
+        ))
+        r1.mark_completed()
+        out = os.path.join(self.tmpdir, "r.json")
+        write_report(r1, out)
+        loaded = load_report(out)
+        self.assertEqual(loaded.command, "check")
+        self.assertEqual(loaded.failed, 1)
+        self.assertEqual(loaded.files[0].rel_path, ".env")
+
+
+class TestEncryptDirPolicy(TestCLI):
+    def test_encrypt_dir_no_extension_files(self):
+        pf = os.path.join(self.tmpdir, ".cryptpolicy")
+        with open(pf, "w") as f:
+            f.write("""[policy]
+required =
+    id_rsa
+    secrets/token
+""")
+        os.makedirs(os.path.join(self.tmpdir, "secrets"))
+        for name, content in [
+            ("id_rsa", "key"),
+            ("secrets/token", "abc"),
+            ("normal.txt", "x"),
+        ]:
+            with open(os.path.join(self.tmpdir, name), "w") as f:
+                f.write(content)
+        rc = self._run([
+            "encrypt-dir", self.tmpdir, "-p", "pw", "-f",
+            "--policy-file", pf,
+        ])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "id_rsa" + DEFAULT_EXT)))
+        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "secrets", "token" + DEFAULT_EXT)))
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "normal.txt" + DEFAULT_EXT)))
+
+
+class TestSecretScan(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_scan_aws_key(self):
+        p = os.path.join(self.tmpdir, "f.py")
+        with open(p, "w") as f:
+            f.write('k = "AKIAIOSFODNN7EXAMPLE"\n')
+        findings = scan_file(p, base_dir=self.tmpdir)
+        types = {f.secret_type for f in findings}
+        self.assertIn("AWS_ACCESS_KEY", types)
+
+    def test_scan_github_token(self):
+        p = os.path.join(self.tmpdir, "f.py")
+        with open(p, "w") as f:
+            f.write('t = "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD"\n')
+        findings = scan_file(p, base_dir=self.tmpdir)
+        types = {f.secret_type for f in findings}
+        self.assertIn("GITHUB_TOKEN", types)
+
+    def test_scan_private_key_header(self):
+        p = os.path.join(self.tmpdir, "key.pem")
+        with open(p, "w") as f:
+            f.write("-----BEGIN RSA PRIVATE KEY-----\n")
+            f.write("abc\n")
+            f.write("-----END RSA PRIVATE KEY-----\n")
+        findings = scan_file(p, base_dir=self.tmpdir)
+        types = {f.secret_type for f in findings}
+        self.assertTrue(
+            "RSA_PRIVATE_KEY" in types or "PRIVATE_KEY_HEADER" in types or "SSH_PRIVATE_KEY" in types,
+            f"Expected private key pattern, got {types}"
+        )
+
+    def test_allowlist_skip(self):
+        p = os.path.join(self.tmpdir, "f.py")
+        with open(p, "w") as f:
+            f.write('k = "AKIAIOSFODNN7EXAMPLE"\n')
+        cfg = ScanConfig(allowlist={"AKIAIOSFODNN7EXAMPLE".lower()})
+        findings = scan_file(p, base_dir=self.tmpdir, config=cfg)
+        self.assertEqual(len(findings), 0)
+
+    def test_load_allowlist_from_file(self):
+        p = os.path.join(self.tmpdir, "allow.txt")
+        with open(p, "w") as f:
+            f.write("# comment\nAKIAIOSFODNN7EXAMPLE\nyour-secret\n")
+        items = load_allowlist_from_file(p)
+        self.assertIn("akiaiosfodnn7example", items)
+        self.assertIn("your-secret", items)
+        self.assertNotIn("# comment", items)
+
+    def test_clean_file(self):
+        p = os.path.join(self.tmpdir, "clean.py")
+        with open(p, "w") as f:
+            f.write("x = 1 + 2\n")
+            f.write('y = "hello"\n')
+        findings = scan_file(p, base_dir=self.tmpdir)
+        self.assertEqual(len(findings), 0)
+
+    def test_scan_directory(self):
+        os.makedirs(os.path.join(self.tmpdir, "sub"))
+        with open(os.path.join(self.tmpdir, "f1.py"), "w") as f:
+            f.write('k = "AKIAIOSFODNN7EXAMPLE"\n')
+        with open(os.path.join(self.tmpdir, "sub", "f2.py"), "w") as f:
+            f.write("x = 1\n")
+        findings = scan_directory(self.tmpdir)
+        self.assertGreaterEqual(len(findings), 1)
+
+
+class TestCheckReportPassed(TestCLI):
+    def test_check_includes_passed_files_in_report(self):
+        with open(os.path.join(self.tmpdir, ".env"), "w") as f:
+            f.write("x=1\n")
+        with open(os.path.join(self.tmpdir, "code.py"), "w") as f:
+            f.write("x=1\n")
+        report = os.path.join(self.tmpdir, "r.json")
+        rc = self._run(["check", self.tmpdir, "--report", report])
+        self.assertEqual(rc, 0)
+        import json
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertGreaterEqual(data["summary"]["passed"], 1)
+        self.assertGreaterEqual(data["summary"]["failed"], 1)
 
 
 if __name__ == "__main__":

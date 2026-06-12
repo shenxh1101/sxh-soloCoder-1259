@@ -2,7 +2,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -61,6 +61,76 @@ class AuditReport:
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
+    def to_sarif(self) -> Dict[str, Any]:
+        results = []
+        for f in self.files:
+            if f.status != "failed":
+                continue
+            level = "error"
+            rule_id = "CC001"
+            message = f.reason or "敏感文件"
+            results.append({
+                "ruleId": rule_id,
+                "level": level,
+                "message": {
+                    "text": message,
+                },
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {
+                                "uri": f.rel_path,
+                            },
+                            "region": {
+                                "startLine": 1,
+                            },
+                        },
+                    },
+                ],
+            })
+
+        return {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {
+                        "driver": {
+                            "name": "config-crypt",
+                            "informationUri": "https://github.com/config-crypt/config-crypt",
+                            "rules": [
+                                {
+                                    "id": "CC001",
+                                    "name": "PlaintextSensitiveFile",
+                                    "shortDescription": {
+                                        "text": "发现明文敏感文件，需要加密",
+                                    },
+                                    "fullDescription": {
+                                        "text": "文件命中敏感规则但以明文形式存在，应使用 config-crypt encrypt 加密后再提交。",
+                                    },
+                                    "help": {
+                                        "text": "使用 config-crypt encrypt <file> 加密该文件，或在策略中添加到 allowed_plaintext。",
+                                    },
+                                    "defaultConfiguration": {
+                                        "level": "error",
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                    "invocations": [
+                        {
+                            "commandLine": self.command,
+                            "startTimeUtc": self.started_at,
+                            "endTimeUtc": self.completed_at or self.started_at,
+                            "executionSuccessful": True,
+                        },
+                    ],
+                    "results": results,
+                },
+            ],
+        }
+
     def to_markdown(self) -> str:
         lines = []
         lines.append(f"# config-crypt 审计报告 - {self.command}")
@@ -118,6 +188,8 @@ def write_report(report: AuditReport, output_path: str, format: Optional[str] = 
             format = "json"
         elif ext in (".md", ".markdown"):
             format = "markdown"
+        elif ext == ".sarif":
+            format = "sarif"
         else:
             format = "json"
 
@@ -126,6 +198,8 @@ def write_report(report: AuditReport, output_path: str, format: Optional[str] = 
         content = report.to_json()
     elif format in ("markdown", "md"):
         content = report.to_markdown()
+    elif format == "sarif":
+        content = json.dumps(report.to_sarif(), indent=2, ensure_ascii=False)
     else:
         raise ValueError(f"不支持的报告格式: {format}")
 
@@ -137,6 +211,72 @@ def write_report(report: AuditReport, output_path: str, format: Optional[str] = 
         f.write(content)
 
     return output_path
+
+
+def diff_reports(current: AuditReport, previous: AuditReport) -> Tuple[Set[str], Set[str], Set[str]]:
+    curr_failed = {f.rel_path for f in current.files if f.status == "failed"}
+    prev_failed = {f.rel_path for f in previous.files if f.status == "failed"}
+    added = curr_failed - prev_failed
+    removed = prev_failed - curr_failed
+    unchanged = curr_failed & prev_failed
+    return added, removed, unchanged
+
+
+def filter_report_by_new(current: AuditReport, previous: AuditReport) -> AuditReport:
+    added, _, _ = diff_reports(current, previous)
+    new_files = [f for f in current.files if f.status != "failed" or f.rel_path in added]
+    new_report = AuditReport(
+        command=current.command + " (diff)",
+        scan_root=current.scan_root,
+        started_at=current.started_at,
+        completed_at=current.completed_at,
+        files=new_files,
+        policy_file=current.policy_file,
+        extra={
+            **current.extra,
+            "diff_with": previous.started_at,
+            "new_failures_only": True,
+            "new_failed_count": len(added),
+        },
+    )
+    for f in new_files:
+        new_report.total_files += 1
+        if f.status == "passed":
+            new_report.passed += 1
+        elif f.status == "failed":
+            new_report.failed += 1
+        elif f.status == "skipped":
+            new_report.skipped += 1
+    return new_report
+
+
+def load_report(path: str) -> AuditReport:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    files = [
+        AuditFileItem(
+            path=item["path"],
+            rel_path=item["rel_path"],
+            status=item["status"],
+            reason=item.get("reason"),
+            details=item.get("details", {}),
+        )
+        for item in data.get("files", [])
+    ]
+    summary = data.get("summary", {})
+    return AuditReport(
+        command=data.get("command", "unknown"),
+        scan_root=data.get("scan_root", ""),
+        started_at=data.get("started_at", ""),
+        completed_at=data.get("completed_at"),
+        total_files=summary.get("total", len(files)),
+        passed=summary.get("passed", 0),
+        failed=summary.get("failed", 0),
+        skipped=summary.get("skipped", 0),
+        files=files,
+        policy_file=data.get("policy_file"),
+        extra=data.get("extra", {}),
+    )
 
 
 def _now_iso() -> str:
