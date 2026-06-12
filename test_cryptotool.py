@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 import shutil
 import sys
@@ -46,12 +48,16 @@ from cryptotool.policy import load_policy, Policy, init_policy_file, generate_po
 from cryptotool.audit import (
     create_report, write_report, AuditReport, AuditFileItem,
     load_report, diff_reports, filter_report_by_new,
+    save_baseline, get_baseline_path,
 )
 from cryptotool import githooks
 from cryptotool.secretscan import (
     scan_file, scan_directory, ScanConfig, SecretFinding,
     load_allowlist_from_file, SECRET_PATTERNS, DEFAULT_ALLOWLIST,
+    SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW, SEVERITY_ORDER,
+    should_fail, findings_by_severity,
 )
+from cryptotool.cli import _validate_paths, _apply_report_filters
 
 
 class TestCrypto(unittest.TestCase):
@@ -1162,6 +1168,476 @@ class TestCheckReportPassed(TestCLI):
             data = json.load(f)
         self.assertGreaterEqual(data["summary"]["passed"], 1)
         self.assertGreaterEqual(data["summary"]["failed"], 1)
+
+
+class TestLoadReportSarif(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_load_sarif_report(self):
+        sarif_data = {
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {"driver": {"name": "config-crypt", "rules": []}},
+                    "invocations": [{"startTimeUtc": "2026-01-01T00:00:00Z"}],
+                    "results": [
+                        {
+                            "ruleId": "CC001",
+                            "level": "error",
+                            "message": {"text": "明文敏感文件"},
+                            "locations": [{"physicalLocation": {"artifactLocation": {"uri": ".env"}, "region": {"startLine": 1}}}],
+                        },
+                        {
+                            "ruleId": "CC002",
+                            "level": "error",
+                            "message": {"text": "高危密钥"},
+                            "locations": [{"physicalLocation": {"artifactLocation": {"uri": "config.py"}, "region": {"startLine": 5}}}],
+                        },
+                    ],
+                }
+            ],
+        }
+        p = os.path.join(self.tmpdir, "r.sarif")
+        with open(p, "w") as f:
+            json.dump(sarif_data, f)
+
+        report = load_report(p)
+        self.assertEqual(report.command, "config-crypt")
+        self.assertEqual(report.failed, 2)
+        self.assertEqual(report.files[0].rel_path, ".env")
+        self.assertEqual(report.files[1].rel_path, "config.py")
+        self.assertEqual(report.extra.get("format"), "sarif")
+
+    def test_load_json_report_still_works(self):
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(path="/a/.env", rel_path=".env", status="failed", reason="敏感"))
+        report.mark_completed()
+        p = os.path.join(self.tmpdir, "r.json")
+        write_report(report, p)
+
+        loaded = load_report(p)
+        self.assertEqual(loaded.command, "check")
+        self.assertEqual(loaded.failed, 1)
+        self.assertEqual(loaded.files[0].rel_path, ".env")
+
+
+class TestPathValidation(unittest.TestCase):
+    def test_validate_paths_single_missing(self):
+        with self.assertRaises(FileNotFoundError) as cm:
+            _validate_paths(["/nonexistent/path/12345"])
+        self.assertIn("/nonexistent/path/12345", str(cm.exception))
+
+    def test_validate_paths_multiple_missing(self):
+        with self.assertRaises(FileNotFoundError) as cm:
+            _validate_paths(["/nonexistent/1", "/nonexistent/2"])
+        self.assertIn("/nonexistent/1", str(cm.exception))
+        self.assertIn("/nonexistent/2", str(cm.exception))
+
+    def test_validate_paths_all_exist(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            x_path = os.path.join(tmp, "x")
+            with open(x_path, "w") as f:
+                f.write("test")
+            _validate_paths([tmp, x_path])
+        except FileNotFoundError:
+            self.fail("不应抛出 FileNotFoundError")
+        finally:
+            shutil.rmtree(tmp)
+
+
+class TestSeverity(unittest.TestCase):
+    def test_secret_patterns_have_severity(self):
+        for p in SECRET_PATTERNS:
+            self.assertEqual(len(p), 4)
+            secret_type, desc, sev, pattern = p
+            self.assertIn(sev, (SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW))
+
+    def test_high_severity_includes_cloud_keys(self):
+        high_types = {pt[0] for pt in SECRET_PATTERNS if pt[2] == SEVERITY_HIGH}
+        self.assertIn("AWS_ACCESS_KEY", high_types)
+        self.assertIn("AWS_SECRET_KEY", high_types)
+        self.assertIn("GCP_SERVICE_ACCOUNT", high_types)
+        self.assertIn("RSA_PRIVATE_KEY", high_types)
+        self.assertIn("GITHUB_TOKEN", high_types)
+
+    def test_medium_severity_includes_jwt_and_password(self):
+        med_types = {pt[0] for pt in SECRET_PATTERNS if pt[2] == SEVERITY_MEDIUM}
+        self.assertIn("JWT_TOKEN", med_types)
+        self.assertIn("GENERIC_PASSWORD", med_types)
+
+    def test_should_fail_threshold(self):
+        h = SecretFinding("a", "a", 1, "AWS", "AKIA...", "AWS Key", SEVERITY_HIGH)
+        m = SecretFinding("a", "a", 1, "JWT", "eyJ...", "JWT", SEVERITY_MEDIUM)
+        l = SecretFinding("a", "a", 1, "X", "x", "Low", SEVERITY_LOW)
+
+        self.assertTrue(should_fail([h], SEVERITY_HIGH))
+        self.assertFalse(should_fail([m], SEVERITY_HIGH))
+        self.assertFalse(should_fail([l], SEVERITY_HIGH))
+
+        self.assertTrue(should_fail([h], SEVERITY_MEDIUM))
+        self.assertTrue(should_fail([m], SEVERITY_MEDIUM))
+        self.assertFalse(should_fail([l], SEVERITY_MEDIUM))
+
+        self.assertTrue(should_fail([h], SEVERITY_LOW))
+        self.assertTrue(should_fail([m], SEVERITY_LOW))
+        self.assertTrue(should_fail([l], SEVERITY_LOW))
+
+        self.assertFalse(should_fail([], SEVERITY_HIGH))
+        self.assertFalse(should_fail([], SEVERITY_LOW))
+
+    def test_findings_by_severity(self):
+        h = SecretFinding("a", "a", 1, "AWS", "x", "AWS", SEVERITY_HIGH)
+        m = SecretFinding("a", "a", 1, "JWT", "x", "JWT", SEVERITY_MEDIUM)
+        m2 = SecretFinding("a", "a", 1, "PASS", "x", "Pass", SEVERITY_MEDIUM)
+        l = SecretFinding("a", "a", 1, "X", "x", "X", SEVERITY_LOW)
+
+        by = findings_by_severity([h, m, m2, l])
+        self.assertEqual(len(by[SEVERITY_HIGH]), 1)
+        self.assertEqual(len(by[SEVERITY_MEDIUM]), 2)
+        self.assertEqual(len(by[SEVERITY_LOW]), 1)
+
+    def test_severity_order(self):
+        self.assertGreater(SEVERITY_ORDER[SEVERITY_HIGH], SEVERITY_ORDER[SEVERITY_MEDIUM])
+        self.assertGreater(SEVERITY_ORDER[SEVERITY_MEDIUM], SEVERITY_ORDER[SEVERITY_LOW])
+
+
+class TestSecretScanSeverity(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_scan_file_high_severity(self):
+        p = os.path.join(self.tmpdir, "config.py")
+        with open(p, "w") as f:
+            f.write('aws_key = "AKIAIOSFODNN7EXAMPLE"\n')
+        findings = scan_file(p, base_dir=self.tmpdir)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, SEVERITY_HIGH)
+        self.assertEqual(findings[0].secret_type, "AWS_ACCESS_KEY")
+        self.assertEqual(findings[0].line, 1)
+
+    def test_scan_file_medium_severity(self):
+        p = os.path.join(self.tmpdir, "config.py")
+        with open(p, "w") as f:
+            f.write('jwt = "eyJ1eXQiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"\n')
+        findings = scan_file(p, base_dir=self.tmpdir)
+        jwt_findings = [f for f in findings if f.secret_type == "JWT_TOKEN"]
+        self.assertGreaterEqual(len(jwt_findings), 1)
+        self.assertEqual(jwt_findings[0].severity, SEVERITY_MEDIUM)
+
+    def test_scan_config_severity_in_details(self):
+        p = os.path.join(self.tmpdir, "config.py")
+        with open(p, "w") as f:
+            f.write('aws_key = "AKIAIOSFODNN7EXAMPLE"\n')
+        findings = scan_file(p, base_dir=self.tmpdir)
+        self.assertEqual(findings[0].severity, SEVERITY_HIGH)
+        self.assertEqual(findings[0].description, "AWS Access Key ID")
+
+
+class TestSarifWithSeverity(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_sarif_includes_severity_rules(self):
+        report = create_report("secret-scan", self.tmpdir)
+        report.add_file(AuditFileItem(
+            path="/a.py", rel_path="a.py", status="failed",
+            reason="高危 · AWS Key (行 1)",
+            details={"line": 1, "type": "AWS_ACCESS_KEY", "severity": SEVERITY_HIGH},
+        ))
+        report.add_file(AuditFileItem(
+            path="/b.py", rel_path="b.py", status="failed",
+            reason="中危 · JWT (行 5)",
+            details={"line": 5, "type": "JWT_TOKEN", "severity": SEVERITY_MEDIUM},
+        ))
+        report.mark_completed()
+
+        sarif = report.to_sarif()
+        rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+        rule_ids = {r["id"] for r in rules}
+        self.assertIn("CC002", rule_ids)
+        self.assertIn("CC003", rule_ids)
+
+        results = sarif["runs"][0]["results"]
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["ruleId"], "CC002")
+        self.assertEqual(results[0]["level"], "error")
+        self.assertEqual(results[0]["locations"][0]["physicalLocation"]["region"]["startLine"], 1)
+        self.assertEqual(results[1]["ruleId"], "CC003")
+        self.assertEqual(results[1]["level"], "warning")
+        self.assertEqual(results[1]["locations"][0]["physicalLocation"]["region"]["startLine"], 5)
+
+
+class TestBaselineFunctions(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_save_baseline_creates_file(self):
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(path="/a/.env", rel_path=".env", status="failed", reason="敏感"))
+        report.mark_completed()
+
+        bp = os.path.join(self.tmpdir, "sub", "baseline.json")
+        result = save_baseline(report, bp)
+        self.assertEqual(result, bp)
+        self.assertTrue(os.path.exists(bp))
+
+        loaded = load_report(bp)
+        self.assertEqual(loaded.command, "check")
+        self.assertEqual(loaded.failed, 1)
+
+    def test_get_baseline_path(self):
+        p = get_baseline_path("/tmp/repo", "check").replace("\\", "/")
+        self.assertEqual(p, "/tmp/repo/.crypt-baseline-check.json")
+        p = get_baseline_path("/tmp/repo", "secret-scan").replace("\\", "/")
+        self.assertEqual(p, "/tmp/repo/.crypt-baseline-secret-scan.json")
+
+
+class TestApplyReportFilters(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_apply_report_filters_no_baseline(self):
+        report = create_report("check", self.tmpdir)
+        report.add_file(AuditFileItem(path="/a", rel_path="a", status="failed", reason="x"))
+        report.mark_completed()
+
+        args = argparse.Namespace(baseline=None, diff_with=None)
+        result = _apply_report_filters(report, args)
+        self.assertEqual(result.failed, 1)
+
+    def test_apply_report_filters_with_baseline(self):
+        prev = create_report("check", self.tmpdir)
+        prev.add_file(AuditFileItem(path="/a.env", rel_path=".env", status="failed", reason="x"))
+        prev.mark_completed()
+        prev_path = os.path.join(self.tmpdir, "prev.json")
+        write_report(prev, prev_path)
+
+        curr = create_report("check", self.tmpdir)
+        curr.add_file(AuditFileItem(path="/a.env", rel_path=".env", status="failed", reason="x"))
+        curr.add_file(AuditFileItem(path="/b.env", rel_path="new.env", status="failed", reason="y"))
+        curr.mark_completed()
+
+        args = argparse.Namespace(baseline=prev_path, diff_with=None)
+        result = _apply_report_filters(curr, args)
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(result.files[0].rel_path, "new.env")
+
+    def test_apply_report_filters_with_sarif_baseline(self):
+        sarif = {
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {"driver": {"name": "config-crypt", "rules": []}},
+                    "invocations": [{}],
+                    "results": [
+                        {
+                            "ruleId": "CC001",
+                            "level": "error",
+                            "message": {"text": "x"},
+                            "locations": [{"physicalLocation": {"artifactLocation": {"uri": ".env"}, "region": {"startLine": 1}}}],
+                        }
+                    ],
+                }
+            ],
+        }
+        sarif_path = os.path.join(self.tmpdir, "prev.sarif")
+        with open(sarif_path, "w") as f:
+            json.dump(sarif, f)
+
+        curr = create_report("check", self.tmpdir)
+        curr.add_file(AuditFileItem(path="/a.env", rel_path=".env", status="failed", reason="x"))
+        curr.add_file(AuditFileItem(path="/b.env", rel_path="new.env", status="failed", reason="y"))
+        curr.mark_completed()
+
+        args = argparse.Namespace(baseline=sarif_path, diff_with=None)
+        result = _apply_report_filters(curr, args)
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(result.files[0].rel_path, "new.env")
+
+    def test_apply_report_filters_missing_baseline(self):
+        curr = create_report("check", self.tmpdir)
+        curr.add_file(AuditFileItem(path="/a.env", rel_path=".env", status="failed", reason="x"))
+        curr.mark_completed()
+
+        args = argparse.Namespace(baseline="/nonexistent/xxx.json", diff_with=None)
+        result = _apply_report_filters(curr, args)
+        self.assertEqual(result.failed, 1)
+
+
+class TestCLIPathValidation(TestCLI):
+    def test_check_nonexistent_path(self):
+        rc = self._run(["check", "/nonexistent/path/12345"])
+        self.assertEqual(rc, 3)
+
+    def test_secret_scan_nonexistent_path(self):
+        rc = self._run(["secret-scan", "/nonexistent/path/12345"])
+        self.assertEqual(rc, 3)
+
+    def test_check_existing_path(self):
+        rc = self._run(["check", self.tmpdir])
+        self.assertEqual(rc, 0)
+
+
+class TestCLISecretScanSeverity(TestCLI):
+    def test_secret_scan_fail_on_severity_high(self):
+        p = os.path.join(self.tmpdir, "config.py")
+        with open(p, "w") as f:
+            f.write('k = "AKIAIOSFODNN7EXAMPLE"\n')
+
+        rc = self._run(["secret-scan", self.tmpdir, "--allowlist-file", "/nonexistent", "--fail-on-severity", "high"])
+        self.assertEqual(rc, 1)
+
+    def test_secret_scan_fail_on_severity_high_passes_medium(self):
+        p = os.path.join(self.tmpdir, "config.py")
+        with open(p, "w") as f:
+            f.write('jwt = "eyJ1eXQiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"\n')
+
+        rc = self._run(["secret-scan", self.tmpdir, "--allowlist-file", "/nonexistent", "--fail-on-severity", "high"])
+        self.assertEqual(rc, 0)
+
+    def test_secret_scan_fail_on_severity_medium(self):
+        p = os.path.join(self.tmpdir, "config.py")
+        with open(p, "w") as f:
+            f.write('jwt = "eyJ1eXQiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"\n')
+
+        rc = self._run(["secret-scan", self.tmpdir, "--allowlist-file", "/nonexistent", "--fail-on-severity", "medium"])
+        self.assertEqual(rc, 1)
+
+    def test_secret_scan_report_includes_severity(self):
+        p = os.path.join(self.tmpdir, "config.py")
+        with open(p, "w") as f:
+            f.write('k = "AKIAIOSFODNN7EXAMPLE"\n')
+
+        report = os.path.join(self.tmpdir, "r.json")
+        self._run(["secret-scan", self.tmpdir, "--allowlist-file", "/nonexistent", "--report", report])
+
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertIn("severity_counts", data["extra"])
+        self.assertEqual(data["extra"]["severity_counts"][SEVERITY_HIGH], 1)
+        self.assertEqual(data["files"][0]["details"]["severity"], SEVERITY_HIGH)
+        self.assertEqual(data["files"][0]["details"]["line"], 1)
+        self.assertEqual(data["files"][0]["details"]["type"], "AWS_ACCESS_KEY")
+
+
+class TestCLIBaseline(TestCLI):
+    def test_check_init_baseline(self):
+        with open(os.path.join(self.tmpdir, ".env"), "w") as f:
+            f.write("x=1\n")
+
+        rc = self._run(["check", self.tmpdir, "--init-baseline", "--policy-file", "/nonexistent"])
+        self.assertEqual(rc, 0)
+
+        bp = get_baseline_path(self.tmpdir, "check")
+        self.assertTrue(os.path.exists(bp))
+
+    def test_check_init_baseline_again_fails(self):
+        with open(os.path.join(self.tmpdir, ".env"), "w") as f:
+            f.write("x=1\n")
+
+        self._run(["check", self.tmpdir, "--init-baseline", "--policy-file", "/nonexistent"])
+        rc = self._run(["check", self.tmpdir, "--init-baseline", "--policy-file", "/nonexistent"])
+        self.assertEqual(rc, 4)
+
+    def test_check_update_baseline(self):
+        with open(os.path.join(self.tmpdir, ".env"), "w") as f:
+            f.write("x=1\n")
+
+        self._run(["check", self.tmpdir, "--init-baseline", "--policy-file", "/nonexistent"])
+        bp = get_baseline_path(self.tmpdir, "check")
+        orig_mtime = os.path.getmtime(bp)
+
+        import time
+        time.sleep(0.1)
+
+        rc = self._run(["check", self.tmpdir, "--update-baseline", "--policy-file", "/nonexistent"])
+        self.assertEqual(rc, 0)
+        new_mtime = os.path.getmtime(bp)
+        self.assertGreater(new_mtime, orig_mtime)
+
+    def test_check_with_baseline_only_new(self):
+        with open(os.path.join(self.tmpdir, ".env"), "w") as f:
+            f.write("x=1\n")
+
+        bp = os.path.join(tempfile.mkdtemp(), "baseline.json")
+        self._run(["check", self.tmpdir, "--init-baseline", "--baseline-path", bp, "--policy-file", "/nonexistent"])
+        self.assertTrue(os.path.exists(bp))
+
+        with open(os.path.join(self.tmpdir, "config.env"), "w") as f:
+            f.write("y=2\n")
+
+        report = os.path.join(self.tmpdir, "r.json")
+        rc = self._run(["check", self.tmpdir, "--baseline", bp, "--report", report, "--policy-file", "/nonexistent"])
+        self.assertEqual(rc, 0)
+
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+        failed = [f for f in data["files"] if f["status"] == "failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["rel_path"], "config.env")
+
+    def test_baseline_init_command(self):
+        with open(os.path.join(self.tmpdir, ".env"), "w") as f:
+            f.write("x=1\n")
+
+        rc = self._run(["baseline", "init", "check", self.tmpdir, "--policy-file", "/nonexistent"])
+        self.assertEqual(rc, 0)
+
+        bp = get_baseline_path(self.tmpdir, "check")
+        self.assertTrue(os.path.exists(bp))
+
+    def test_baseline_init_command_again_fails(self):
+        with open(os.path.join(self.tmpdir, ".env"), "w") as f:
+            f.write("x=1\n")
+
+        self._run(["baseline", "init", "check", self.tmpdir, "--policy-file", "/nonexistent"])
+        rc = self._run(["baseline", "init", "check", self.tmpdir, "--policy-file", "/nonexistent"])
+        self.assertEqual(rc, 4)
+
+    def test_baseline_update_command(self):
+        with open(os.path.join(self.tmpdir, ".env"), "w") as f:
+            f.write("x=1\n")
+
+        self._run(["baseline", "init", "check", self.tmpdir, "--policy-file", "/nonexistent"])
+        rc = self._run(["baseline", "update", "check", self.tmpdir, "--policy-file", "/nonexistent"])
+        self.assertEqual(rc, 0)
+
+    def test_secret_scan_with_sarif_baseline(self):
+        with open(os.path.join(self.tmpdir, "a.py"), "w") as f:
+            f.write('k = "AKIAIOSFODNN7EXAMPLE"\n')
+
+        sarif_path = os.path.join(self.tmpdir, "base.sarif")
+        self._run(["secret-scan", self.tmpdir, "--allowlist-file", "/nonexistent", "--report", sarif_path])
+
+        with open(os.path.join(self.tmpdir, "b.py"), "w") as f:
+            f.write('k2 = "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD"\n')
+
+        report = os.path.join(self.tmpdir, "r.json")
+        rc = self._run(["secret-scan", self.tmpdir, "--allowlist-file", "/nonexistent", "--baseline", sarif_path, "--report", report])
+        self.assertEqual(rc, 0)
+
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+        failed = [f for f in data["files"] if f["status"] == "failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["rel_path"], "b.py")
 
 
 if __name__ == "__main__":

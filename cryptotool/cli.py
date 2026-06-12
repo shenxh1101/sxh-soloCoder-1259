@@ -24,8 +24,28 @@ from .filehandler import (
     match_sensitive_files_local,
 )
 from .policy import Policy, PolicyError, load_policy, init_policy_file, generate_policy_template
-from .audit import AuditFileItem, AuditReport, create_report, write_report, filter_report_by_new, load_report
-from .secretscan import ScanConfig, scan_file, scan_directory, load_allowlist_from_file
+from .audit import (
+    AuditFileItem,
+    AuditReport,
+    create_report,
+    write_report,
+    filter_report_by_new,
+    load_report,
+    save_baseline,
+    get_baseline_path,
+)
+from .secretscan import (
+    ScanConfig,
+    scan_file,
+    scan_directory,
+    load_allowlist_from_file,
+    findings_by_severity,
+    should_fail,
+    SEVERITY_HIGH,
+    SEVERITY_MEDIUM,
+    SEVERITY_LOW,
+    SEVERITY_ORDER,
+)
 from . import githooks
 from .githooks import (
     get_staged_files,
@@ -90,8 +110,65 @@ def add_audit_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--diff-with",
-        help="与之前的报告做 diff，只显示新增的问题（需提供之前的 json 报告路径）",
+        help="与之前的报告做 diff，只显示新增的问题（支持 JSON 或 SARIF 报告）",
     )
+    parser.add_argument(
+        "--baseline",
+        help="与基线报告比较，只拦截新增问题（支持 JSON 或 SARIF 格式），等同于 --diff-with",
+    )
+    parser.add_argument(
+        "--init-baseline",
+        action="store_true",
+        help="扫描完成后，将当前报告保存为基线文件（默认路径：.crypt-baseline-<command>.json）",
+    )
+    parser.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="扫描完成后，更新基线文件为当前报告（等同于 --init-baseline，但会覆盖已有基线）",
+    )
+    parser.add_argument(
+        "--baseline-path",
+        help="自定义基线文件路径（用于 --init-baseline / --update-baseline / --baseline）",
+    )
+
+
+def _validate_paths(paths: List[str]) -> None:
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        if len(missing) == 1:
+            raise FileNotFoundError(f"路径不存在: {missing[0]}")
+        raise FileNotFoundError(f"以下路径不存在: {', '.join(missing)}")
+
+
+def _apply_report_filters(
+    report: AuditReport,
+    args,
+) -> AuditReport:
+    diff_path = args.baseline or args.diff_with
+    if diff_path:
+        try:
+            baseline = load_report(diff_path)
+            report = filter_report_by_new(report, baseline)
+        except FileNotFoundError:
+            print(f"[警告] 基线/对比报告不存在: {diff_path}，跳过 diff，使用完整报告", file=sys.stderr)
+    return report
+
+
+def _save_baseline_if_needed(report: AuditReport, args, command: str) -> Optional[str]:
+    if not (args.init_baseline or args.update_baseline):
+        return None
+    scan_root = report.scan_root or "."
+    if args.baseline_path:
+        baseline_path = args.baseline_path
+    else:
+        baseline_path = get_baseline_path(scan_root, command)
+    if os.path.exists(baseline_path) and args.init_baseline and not args.update_baseline:
+        raise FileExistsError(
+            f"基线文件已存在: {baseline_path}。使用 --update-baseline 覆盖，或指定 --baseline-path"
+        )
+    saved = save_baseline(report, baseline_path)
+    print(f"[基线] 已保存基线: {saved}", file=sys.stderr)
+    return saved
 
 
 def add_policy_arg(parser: argparse.ArgumentParser) -> None:
@@ -261,9 +338,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_sscan.add_argument(
         "--fail",
         action="store_true",
-        help="发现敏感信息时以非零退出码返回（用于 CI）",
+        help="发现任何敏感信息时以非零退出码返回（用于 CI）",
+    )
+    p_sscan.add_argument(
+        "--fail-on-severity",
+        choices=["high", "medium", "low"],
+        default=None,
+        help="按严重级别决定 CI 失败：high（仅高危失败）/ medium（中高危失败）/ low（所有失败）",
     )
     add_audit_args(p_sscan)
+
+    p_base = sub.add_parser("baseline", help="基线管理：init-baseline / update-baseline")
+    base_sub = p_base.add_subparsers(dest="baseline_action", required=True, metavar="ACTION")
+    p_init = base_sub.add_parser("init", help="初始化基线：先扫描指定命令，再保存基线")
+    p_init.add_argument("scan_command", choices=["check", "verify", "secret-scan"], help="要执行的扫描命令")
+    p_init.add_argument("path", nargs="?", default=".", help="扫描路径")
+    p_init.add_argument("--baseline-path", help="自定义基线文件输出路径")
+    p_init.add_argument("--policy-file", default=".cryptpolicy", help="策略文件（用于 check/verify）")
+    p_init.add_argument("--allowlist-file", default=".cryptallowlist", help="白名单文件（用于 secret-scan）")
+    p_init.add_argument("--no-recursive", action="store_true", help="不递归子目录")
+
+    p_update = base_sub.add_parser("update", help="更新基线：重新扫描并覆盖已有基线")
+    p_update.add_argument("scan_command", choices=["check", "verify", "secret-scan"], help="要执行的扫描命令")
+    p_update.add_argument("path", nargs="?", default=".", help="扫描路径")
+    p_update.add_argument("--baseline-path", help="自定义基线文件路径")
+    p_update.add_argument("--policy-file", default=".cryptpolicy", help="策略文件（用于 check/verify）")
+    p_update.add_argument("--allowlist-file", default=".cryptallowlist", help="白名单文件（用于 secret-scan）")
+    p_update.add_argument("--no-recursive", action="store_true", help="不递归子目录")
 
     return parser
 
@@ -419,6 +520,8 @@ def cmd_gen_key(args) -> int:
 
 
 def cmd_verify(args) -> int:
+    _validate_paths([args.path])
+
     mode, key_or_pwd = resolve_key(
         password=args.password,
         key_file=args.key_file,
@@ -464,10 +567,14 @@ def cmd_verify(args) -> int:
                 ))
         print(f"\n校验完成: 通过 {ok}，失败 {fail}，共 {total} 个")
         report.mark_completed()
+
+        report = _apply_report_filters(report, args)
+        _save_baseline_if_needed(report, args, "verify")
+
         if args.report:
-            report = _apply_report_diff(report, getattr(args, "diff_with", None))
             write_report(report, args.report, format=args.report_format)
             print(f"\n审计报告已写入: {args.report}")
+
         return 0 if fail == 0 else 1
     else:
         scan_root = os.path.dirname(args.path) or "."
@@ -494,8 +601,11 @@ def cmd_verify(args) -> int:
             ))
             rc = 1
         report.mark_completed()
+
+        report = _apply_report_filters(report, args)
+        _save_baseline_if_needed(report, args, "verify")
+
         if args.report:
-            report = _apply_report_diff(report, getattr(args, "diff_with", None))
             write_report(report, args.report, format=args.report_format)
             print(f"\n审计报告已写入: {args.report}")
         return rc
@@ -579,6 +689,9 @@ def cmd_rekey(args) -> int:
 
 
 def cmd_check(args) -> int:
+    if not args.staged:
+        _validate_paths([args.path])
+
     report = None
     try:
         if args.staged:
@@ -693,21 +806,34 @@ def cmd_check(args) -> int:
     if report:
         report.mark_completed()
 
-    if not sensitive_display:
-        print("未发现明文敏感文件 ✓")
+    original_failed = len(sensitive_display)
+    report = _apply_report_filters(report, args)
+    _save_baseline_if_needed(report, args, "check")
+
+    is_diff_mode = bool(args.baseline or args.diff_with)
+    if is_diff_mode:
+        new_sensitive = [f.rel_path for f in report.files if f.status == "failed"]
+        display_list = new_sensitive
+    else:
+        display_list = sensitive_display
+
+    if not display_list:
+        if is_diff_mode and original_failed > 0:
+            print(f"未发现新增明文敏感文件 ✓（基线中已有 {original_failed} 个已知问题）")
+        else:
+            print("未发现明文敏感文件 ✓")
         if args.report and report:
-            report = _apply_report_diff(report, getattr(args, "diff_with", None))
             write_report(report, args.report, format=args.report_format)
             print(f"\n审计报告已写入: {args.report}")
         return 0
 
-    print(f"发现 {len(sensitive_display)} 个明文敏感文件（需先加密后再提交）:")
-    for f in sensitive_display:
+    prefix = "新增 " if is_diff_mode else ""
+    print(f"发现 {prefix}{len(display_list)} 个明文敏感文件（需先加密后再提交）:")
+    for f in display_list:
         print(f"  ⚠  {f}")
     print(f"\n提示: 使用 config-crypt encrypt <file> 加密，或 config-crypt git-hook install 自动处理")
 
     if args.report and report:
-        report = _apply_report_diff(report, getattr(args, "diff_with", None))
         write_report(report, args.report, format=args.report_format)
         print(f"\n审计报告已写入: {args.report}")
 
@@ -781,20 +907,6 @@ def cmd_list(args) -> int:
     return 0
 
 
-def _apply_report_diff(report: AuditReport, diff_path: Optional[str]) -> AuditReport:
-    if not diff_path:
-        return report
-    if not os.path.exists(diff_path):
-        print(f"警告: diff 报告不存在 {diff_path}，忽略 --diff-with", file=sys.stderr)
-        return report
-    try:
-        prev = load_report(diff_path)
-        return filter_report_by_new(report, prev)
-    except Exception as e:
-        print(f"警告: 读取 diff 报告失败: {e}", file=sys.stderr)
-        return report
-
-
 def cmd_policy(args) -> int:
     if args.policy_action == "init":
         try:
@@ -838,8 +950,13 @@ def cmd_policy(args) -> int:
 
 
 def cmd_secret_scan(args) -> int:
+    _validate_paths([args.path])
+
     allowlist = load_allowlist_from_file(args.allowlist_file)
-    config = ScanConfig(allowlist=allowlist)
+    config = ScanConfig(
+        allowlist=allowlist,
+        fail_on_severity=args.fail_on_severity,
+    )
 
     if os.path.isfile(args.path):
         scan_root = os.path.dirname(args.path) or "."
@@ -857,14 +974,18 @@ def cmd_secret_scan(args) -> int:
     report.extra["allowlist_file"] = args.allowlist_file
     report.extra["scanned_with_allowlist"] = len(allowlist) > 0
 
+    original_findings = findings
     if not findings:
         print("未发现敏感信息 ✓")
         report.add_file(AuditFileItem(
             path=scan_root, rel_path=scan_root, status="passed", reason="无敏感信息",
         ))
         report.mark_completed()
+
+        report = _apply_report_filters(report, args)
+        _save_baseline_if_needed(report, args, "secret-scan")
+
         if args.report:
-            report = _apply_report_diff(report, args.diff_with)
             write_report(report, args.report, format=args.report_format)
             print(f"\n审计报告已写入: {args.report}")
         return 0
@@ -872,32 +993,146 @@ def cmd_secret_scan(args) -> int:
     by_file: Dict[str, List] = {}
     for f in findings:
         by_file.setdefault(f.rel_path, []).append(f)
+        severity_label = {
+            SEVERITY_HIGH: "高危",
+            SEVERITY_MEDIUM: "中危",
+            SEVERITY_LOW: "低危",
+        }.get(f.severity, "未知")
         report.add_file(AuditFileItem(
             path=f.file_path,
             rel_path=f.rel_path,
             status="failed",
-            reason=f"{f.description} (行 {f.line})",
-            details={"line": f.line, "type": f.secret_type},
+            reason=f"{severity_label} · {f.description} (行 {f.line})",
+            details={
+                "line": f.line,
+                "type": f.secret_type,
+                "severity": f.severity,
+                "matched": f.matched_text,
+            },
         ))
 
-    print(f"发现 {len(findings)} 处敏感信息，涉及 {len(by_file)} 个文件:")
+    by_sev = findings_by_severity(findings)
+    sev_counts = {k: len(v) for k, v in by_sev.items() if v}
+
+    report.extra["severity_counts"] = sev_counts
+
+    report.mark_completed()
+    original_report = report
+    report = _apply_report_filters(report, args)
+    _save_baseline_if_needed(report, args, "secret-scan")
+
+    is_diff_mode = bool(args.baseline or args.diff_with)
+    if is_diff_mode:
+        new_finding_paths = {f.rel_path for f in report.files if f.status == "failed"}
+        filtered_findings = [f for f in findings if f.rel_path in new_finding_paths]
+        by_file = {}
+        for f in filtered_findings:
+            by_file.setdefault(f.rel_path, []).append(f)
+        findings = filtered_findings
+
+    if not findings:
+        print(f"未发现新增敏感信息 ✓（基线中已有 {len(original_findings)} 个已知问题）")
+        if args.report:
+            write_report(report, args.report, format=args.report_format)
+            print(f"\n审计报告已写入: {args.report}")
+        return 0
+
+    sev_line = ", ".join(
+        f"{'高危' if k == SEVERITY_HIGH else '中危' if k == SEVERITY_MEDIUM else '低危'}: {v}"
+        for k, v in sorted(sev_counts.items(), key=lambda x: -SEVERITY_ORDER[x[0]])
+    )
+
+    prefix = "新增 " if is_diff_mode else ""
+    print(f"发现 {prefix}{len(findings)} 处敏感信息（{sev_line}），涉及 {len(by_file)} 个文件:")
     for rel_path, items in by_file.items():
         print(f"\n  ⚠  {rel_path}:")
         for item in items:
+            sev = {
+                SEVERITY_HIGH: "🔴 高危",
+                SEVERITY_MEDIUM: "🟡 中危",
+                SEVERITY_LOW: "🔵 低危",
+            }.get(item.severity, "⚪ 未知")
             preview = item.matched_text[:60]
             if len(item.matched_text) > 60:
                 preview += "..."
-            print(f"    第 {item.line} 行 [{item.description}]: {preview}")
+            print(f"    第 {item.line} 行 {sev} [{item.description}]: {preview}")
+
+    fail_threshold = args.fail_on_severity
+    if fail_threshold:
+        sev_label = "高危" if fail_threshold == SEVERITY_HIGH else "中高危" if fail_threshold == SEVERITY_MEDIUM else "所有"
+        print(f"\nCI 失败级别: {sev_label} 及以上")
 
     print(f"\n提示: 使用 --allowlist-file 添加白名单放过测试样例，或加密这些文件")
 
-    report.mark_completed()
     if args.report:
-        report = _apply_report_diff(report, args.diff_with)
         write_report(report, args.report, format=args.report_format)
         print(f"\n审计报告已写入: {args.report}")
 
-    return 1 if args.fail else 0
+    if args.fail:
+        return 1 if should_fail(findings, fail_threshold) else 0
+    if fail_threshold:
+        return 1 if should_fail(findings, fail_threshold) else 0
+    return 0
+
+
+def cmd_baseline(args) -> int:
+    _validate_paths([args.path])
+
+    scan_command = args.scan_command
+    scan_args = argparse.Namespace(
+        path=args.path,
+        policy_file=getattr(args, "policy_file", ".cryptpolicy"),
+        allowlist_file=getattr(args, "allowlist_file", ".cryptallowlist"),
+        no_recursive=args.no_recursive,
+        staged=False,
+        fail=False,
+        fail_on_severity=None,
+        patterns_file=".cryptignore",
+        report=None,
+        report_format=None,
+        diff_with=None,
+        baseline=None,
+        init_baseline=args.baseline_action == "init",
+        update_baseline=args.baseline_action == "update",
+        baseline_path=args.baseline_path,
+        password=None,
+        key_file=None,
+        env_key="CONFIG_CRYPT_KEY",
+        old_password=None,
+        old_key_file=None,
+        old_env_key="CONFIG_CRYPT_OLD_KEY",
+        new_password=None,
+        new_key_file=None,
+        new_env_key="CONFIG_CRYPT_NEW_KEY",
+    )
+
+    command_handlers = {
+        "check": cmd_check,
+        "verify": cmd_verify,
+        "secret-scan": cmd_secret_scan,
+    }
+
+    handler = command_handlers[scan_command]
+    try:
+        handler(scan_args)
+    except SystemExit:
+        pass
+    except (FileNotFoundError, FileExistsError):
+        raise
+    except Exception as e:
+        print(f"基线扫描失败: {e}", file=sys.stderr)
+        return 1
+
+    scan_root = args.path if os.path.isdir(args.path) else os.path.dirname(args.path) or "."
+    baseline_path = args.baseline_path or get_baseline_path(scan_root, scan_command)
+
+    if os.path.exists(baseline_path):
+        print(f"✅ 基线已{'初始化' if args.baseline_action == 'init' else '更新'}: {baseline_path}")
+        print(f"   后续使用 `config-crypt {scan_command} {args.path} --baseline {baseline_path}` 只拦截新增问题")
+        return 0
+
+    print(f"❌ 基线未生成: {baseline_path}", file=sys.stderr)
+    return 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -919,10 +1154,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         "list": cmd_list,
         "policy": cmd_policy,
         "secret-scan": cmd_secret_scan,
+        "baseline": cmd_baseline,
     }
 
     try:
         return handlers[args.command](args)
+    except FileNotFoundError as e:
+        print(f"[错误] {e}", file=sys.stderr)
+        print("请检查路径是否正确，避免流水线误判通过。", file=sys.stderr)
+        return 3
+    except FileExistsError as e:
+        print(f"[错误] {e}", file=sys.stderr)
+        return 4
     except (CryptoError, FileHandlerError, KeyManagerError) as e:
         if isinstance(e, PasswordError):
             print(f"密码错误: {e}", file=sys.stderr)

@@ -62,32 +62,76 @@ class AuditReport:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     def to_sarif(self) -> Dict[str, Any]:
+        from .secretscan import SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW
+
+        SARIF_RULES = [
+            {
+                "id": "CC001",
+                "name": "PlaintextSensitiveFile",
+                "shortDescription": {"text": "发现明文敏感文件，需要加密"},
+                "fullDescription": {"text": "文件命中敏感规则但以明文形式存在，应使用 config-crypt encrypt 加密后再提交。"},
+                "help": {"text": "使用 config-crypt encrypt <file> 加密该文件，或在策略中添加到 allowed_plaintext。"},
+                "defaultConfiguration": {"level": "error"},
+            },
+            {
+                "id": "CC002",
+                "name": "HighSeveritySecret",
+                "shortDescription": {"text": "发现高危密钥（云厂商密钥、私钥、平台Token）"},
+                "fullDescription": {"text": "在文件内容中发现了高危敏感信息，可能导致账号被入侵、资源被盗用。"},
+                "help": {"text": "立即旋转该密钥，并从代码中移除，使用环境变量或密钥管理服务。"},
+                "defaultConfiguration": {"level": "error"},
+            },
+            {
+                "id": "CC003",
+                "name": "MediumSeveritySecret",
+                "shortDescription": {"text": "发现中危密钥（JWT、通用密码赋值）"},
+                "fullDescription": {"text": "在文件内容中发现了中危敏感信息，可能导致账户或服务被盗用。"},
+                "help": {"text": "立即撤销该密钥，并从代码中移除，使用更安全的配置方式。"},
+                "defaultConfiguration": {"level": "warning"},
+            },
+            {
+                "id": "CC004",
+                "name": "LowSeveritySecret",
+                "shortDescription": {"text": "发现低危密钥"},
+                "fullDescription": {"text": "在文件内容中发现了低危敏感信息。"},
+                "help": {"text": "请检查该信息是否真的是敏感信息，如属实请移除。"},
+                "defaultConfiguration": {"level": "note"},
+            },
+        ]
+        RULE_MAP = {r["id"]: r for r in SARIF_RULES}
+
+        def _rule_and_level(f: AuditFileItem) -> Tuple[str, str]:
+            sev = f.details.get("severity")
+            if sev == SEVERITY_HIGH:
+                return "CC002", "error"
+            elif sev == SEVERITY_MEDIUM:
+                return "CC003", "warning"
+            elif sev == SEVERITY_LOW:
+                return "CC004", "note"
+            return "CC001", "error"
+
         results = []
+        used_rule_ids = set()
         for f in self.files:
             if f.status != "failed":
                 continue
-            level = "error"
-            rule_id = "CC001"
+            rule_id, level = _rule_and_level(f)
+            used_rule_ids.add(rule_id)
+            start_line = f.details.get("line", 1)
             message = f.reason or "敏感文件"
             results.append({
                 "ruleId": rule_id,
                 "level": level,
-                "message": {
-                    "text": message,
-                },
-                "locations": [
-                    {
-                        "physicalLocation": {
-                            "artifactLocation": {
-                                "uri": f.rel_path,
-                            },
-                            "region": {
-                                "startLine": 1,
-                            },
-                        },
+                "message": {"text": message},
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": f.rel_path},
+                        "region": {"startLine": start_line},
                     },
-                ],
+                }],
             })
+
+        active_rules = [RULE_MAP[rid] for rid in sorted(used_rule_ids)] if used_rule_ids else SARIF_RULES
 
         return {
             "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
@@ -97,25 +141,9 @@ class AuditReport:
                     "tool": {
                         "driver": {
                             "name": "config-crypt",
+                            "version": "1.0.0",
                             "informationUri": "https://github.com/config-crypt/config-crypt",
-                            "rules": [
-                                {
-                                    "id": "CC001",
-                                    "name": "PlaintextSensitiveFile",
-                                    "shortDescription": {
-                                        "text": "发现明文敏感文件，需要加密",
-                                    },
-                                    "fullDescription": {
-                                        "text": "文件命中敏感规则但以明文形式存在，应使用 config-crypt encrypt 加密后再提交。",
-                                    },
-                                    "help": {
-                                        "text": "使用 config-crypt encrypt <file> 加密该文件，或在策略中添加到 allowed_plaintext。",
-                                    },
-                                    "defaultConfiguration": {
-                                        "level": "error",
-                                    },
-                                },
-                            ],
+                            "rules": active_rules,
                         },
                     },
                     "invocations": [
@@ -250,9 +278,56 @@ def filter_report_by_new(current: AuditReport, previous: AuditReport) -> AuditRe
     return new_report
 
 
+def _is_sarif(data: Dict) -> bool:
+    return data.get("version") == "2.1.0" and "runs" in data
+
+
+def _parse_sarif(data: Dict) -> AuditReport:
+    run = data["runs"][0]
+    results = run.get("results", [])
+    invocation = run.get("invocations", [{}])[0]
+    driver = run["tool"]["driver"]
+
+    files = []
+    failed_paths = set()
+    for r in results:
+        level = r.get("level", "error")
+        status = "failed" if level in ("error", "warning") else "passed"
+        for loc in r.get("locations", []):
+            uri = loc.get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
+            if not uri:
+                continue
+            failed_paths.add(uri)
+            files.append(AuditFileItem(
+                path=uri,
+                rel_path=uri,
+                status=status,
+                reason=r.get("message", {}).get("text", ""),
+                details={"rule_id": r.get("ruleId", ""), "level": level},
+            ))
+
+    return AuditReport(
+        command=driver.get("name", "unknown"),
+        scan_root="",
+        started_at=invocation.get("startTimeUtc", ""),
+        completed_at=invocation.get("endTimeUtc", ""),
+        total_files=len(results),
+        passed=0,
+        failed=len(files),
+        skipped=0,
+        files=files,
+        policy_file=None,
+        extra={"format": "sarif"},
+    )
+
+
 def load_report(path: str) -> AuditReport:
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
+
+    if _is_sarif(data):
+        return _parse_sarif(data)
+
     files = [
         AuditFileItem(
             path=item["path"],
@@ -277,6 +352,20 @@ def load_report(path: str) -> AuditReport:
         policy_file=data.get("policy_file"),
         extra=data.get("extra", {}),
     )
+
+
+def save_baseline(report: AuditReport, baseline_path: str) -> str:
+    out = report.to_dict()
+    dir_path = os.path.dirname(os.path.abspath(baseline_path))
+    if dir_path and not os.path.exists(dir_path):
+        os.makedirs(dir_path, exist_ok=True)
+    with open(baseline_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    return baseline_path
+
+
+def get_baseline_path(scan_root: str, command: str) -> str:
+    return os.path.join(scan_root, f".crypt-baseline-{command}.json")
 
 
 def _now_iso() -> str:

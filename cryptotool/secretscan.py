@@ -4,6 +4,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 
+SEVERITY_HIGH = "high"
+SEVERITY_MEDIUM = "medium"
+SEVERITY_LOW = "low"
+SEVERITY_ORDER = {SEVERITY_HIGH: 3, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 1}
+
+
 @dataclass
 class SecretFinding:
     file_path: str
@@ -12,67 +18,80 @@ class SecretFinding:
     secret_type: str
     matched_text: str
     description: str
+    severity: str = SEVERITY_MEDIUM
 
 
-SECRET_PATTERNS: List[Tuple[str, str, re.Pattern]] = [
+SECRET_PATTERNS: List[Tuple[str, str, str, re.Pattern]] = [
     (
         "RSA_PRIVATE_KEY",
         "RSA 私钥",
+        SEVERITY_HIGH,
         re.compile(r"-----BEGIN (RSA |OPENSSH |DSA |EC |PGP |ENCRYPTED )?PRIVATE KEY-----"),
     ),
     (
         "SSH_PRIVATE_KEY",
         "SSH 私钥",
+        SEVERITY_HIGH,
         re.compile(r"-----BEGIN (OPENSSH|RSA|DSA|EC|ED25519) PRIVATE KEY-----"),
     ),
     (
         "AWS_ACCESS_KEY",
         "AWS Access Key ID",
+        SEVERITY_HIGH,
         re.compile(r"(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])"),
     ),
     (
         "AWS_SECRET_KEY",
         "AWS Secret Access Key",
+        SEVERITY_HIGH,
         re.compile(r"(?i)aws(.{0,20})?['\"][0-9a-zA-Z/+]{40}['\"]"),
     ),
     (
         "GCP_SERVICE_ACCOUNT",
         "GCP 服务账号密钥",
+        SEVERITY_HIGH,
         re.compile(r'"type"\s*:\s*"service_account"'),
     ),
     (
         "GITHUB_TOKEN",
         "GitHub Personal Access Token",
+        SEVERITY_HIGH,
         re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,251}"),
     ),
     (
         "GITHUB_CLASSIC_TOKEN",
         "GitHub 经典 Token",
+        SEVERITY_HIGH,
         re.compile(r"(?<![A-Za-z0-9])[a-f0-9]{40}(?![A-Za-z0-9])"),
     ),
     (
         "SLACK_TOKEN",
         "Slack Token",
+        SEVERITY_HIGH,
         re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
     ),
     (
         "SLACK_WEBHOOK",
         "Slack Webhook",
+        SEVERITY_HIGH,
         re.compile(r"https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{24}"),
     ),
     (
         "STRIPE_KEY",
         "Stripe API Key",
+        SEVERITY_HIGH,
         re.compile(r"sk_live_[0-9a-zA-Z]{24,}"),
     ),
     (
         "PRIVATE_KEY_HEADER",
         "通用私钥头",
+        SEVERITY_HIGH,
         re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
     ),
     (
         "GENERIC_PASSWORD",
         "通用密码赋值",
+        SEVERITY_MEDIUM,
         re.compile(
             r"(?im)(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
             r"(\s*[:=]\s*)(['\"]?)(?!(?:test|dummy|example|sample|xxxx|changeme|None|null|false|true|0|1)\b)"
@@ -82,21 +101,25 @@ SECRET_PATTERNS: List[Tuple[str, str, re.Pattern]] = [
     (
         "JWT_TOKEN",
         "JWT (JSON Web Token)",
+        SEVERITY_MEDIUM,
         re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     ),
     (
         "HEROKU_API_KEY",
         "Heroku API Key",
+        SEVERITY_HIGH,
         re.compile(r"(?i)heroku(.{0,20})?['\"][0-9a-fA-F-]{36}['\"]"),
     ),
     (
         "TWILIO_API_KEY",
         "Twilio API Key",
+        SEVERITY_HIGH,
         re.compile(r"SK[0-9a-fA-F]{32}"),
     ),
     (
         "SENDGRID_API_KEY",
         "SendGrid API Key",
+        SEVERITY_HIGH,
         re.compile(r"SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}"),
     ),
 ]
@@ -149,8 +172,9 @@ class ScanConfig:
     max_file_size: int = 1 * 1024 * 1024
     ignore_extensions: Set[str] = field(default_factory=lambda: set(DEFAULT_IGNORE_EXTENSIONS))
     allowlist: Set[str] = field(default_factory=lambda: set(DEFAULT_ALLOWLIST))
-    extra_patterns: List[Tuple[str, str, re.Pattern]] = field(default_factory=list)
+    extra_patterns: List[Tuple[str, str, str, re.Pattern]] = field(default_factory=list)
     patterns_file: Optional[str] = None
+    fail_on_severity: Optional[str] = None
 
 
 def load_allowlist_from_file(allowlist_file: str) -> Set[str]:
@@ -215,7 +239,7 @@ def scan_file(
         allowlisted = any(allow.lower() in line_lower for allow in config.allowlist)
         if allowlisted:
             continue
-        for secret_type, description, pattern in patterns:
+        for secret_type, description, severity, pattern in patterns:
             for match in pattern.finditer(line):
                 matched = match.group(0)
                 if matched.lower() in config.allowlist:
@@ -227,9 +251,30 @@ def scan_file(
                     secret_type=secret_type,
                     matched_text=matched,
                     description=description,
+                    severity=severity,
                 ))
                 break
     return findings
+
+
+def should_fail(findings: List[SecretFinding], fail_on_severity: Optional[str] = None) -> bool:
+    if not findings:
+        return False
+    if not fail_on_severity:
+        return True
+    threshold = SEVERITY_ORDER.get(fail_on_severity, 0)
+    return any(SEVERITY_ORDER.get(f.severity, 0) >= threshold for f in findings)
+
+
+def findings_by_severity(findings: List[SecretFinding]) -> Dict[str, List[SecretFinding]]:
+    result: Dict[str, List[SecretFinding]] = {
+        SEVERITY_HIGH: [],
+        SEVERITY_MEDIUM: [],
+        SEVERITY_LOW: [],
+    }
+    for f in findings:
+        result.setdefault(f.severity, []).append(f)
+    return result
 
 
 def scan_directory(
