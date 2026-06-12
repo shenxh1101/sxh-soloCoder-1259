@@ -13,6 +13,8 @@ from cryptotool.crypto import (
     encrypt_with_password,
     decrypt_with_password,
     generate_key,
+    verify_data,
+    verify_with_password,
     PasswordError,
     TamperedError,
     CryptoError,
@@ -26,7 +28,13 @@ from cryptotool.filehandler import (
     encrypt_directory_archive,
     decrypt_directory_archive,
     collect_files,
+    verify_file,
+    verify_directory_bulk,
+    rekey_file,
+    rekey_directory_bulk,
     is_config_file,
+    is_sensitive_file,
+    match_sensitive_files_local,
     DEFAULT_EXT,
 )
 from cryptotool.keymanager import (
@@ -95,6 +103,40 @@ class TestCrypto(unittest.TestCase):
     def test_wrong_key_size(self):
         with self.assertRaises(CryptoError):
             encrypt_data(self.test_data, b"short-key")
+
+    def test_verify_with_key_success(self):
+        key = generate_key()
+        ct = encrypt_data(self.test_data, key)
+        verify_data(ct, key)
+
+    def test_verify_with_key_wrong(self):
+        key1 = generate_key()
+        key2 = generate_key()
+        ct = encrypt_data(self.test_data, key1)
+        with self.assertRaises(PasswordError):
+            verify_data(ct, key2)
+
+    def test_verify_with_password_success(self):
+        ct = encrypt_with_password(self.test_data, "good")
+        verify_with_password(ct, "good")
+
+    def test_verify_with_password_wrong(self):
+        ct = encrypt_with_password(self.test_data, "good")
+        with self.assertRaises(PasswordError):
+            verify_with_password(ct, "bad")
+
+    def test_verify_tampered(self):
+        key = generate_key()
+        ct = bytearray(encrypt_data(self.test_data, key))
+        ct[-5] ^= 0xFF
+        with self.assertRaises(TamperedError):
+            verify_data(bytes(ct), key)
+
+    def test_verify_does_not_return_plaintext(self):
+        key = generate_key()
+        ct = encrypt_data(self.test_data, key)
+        result = verify_data(ct, key)
+        self.assertIsNone(result)
 
 
 class TestKeyManager(unittest.TestCase):
@@ -250,6 +292,114 @@ class TestFileHandler(unittest.TestCase):
         self.assertTrue(res.success)
         self.assertEqual(res.target, custom_out)
 
+    def test_verify_file_with_key(self):
+        key = generate_key()
+        src = self._make_file("v.env", b"x=1")
+        enc = encrypt_file(src, key=key)
+        self.assertTrue(enc.success)
+        v = verify_file(enc.target, key=key)
+        self.assertTrue(v.success)
+        v2 = verify_file(enc.target, password="wrong")
+        self.assertFalse(v2.success)
+
+    def test_verify_file_with_password(self):
+        src = self._make_file("v.env", b"x=1")
+        enc = encrypt_file(src, password="mypw")
+        self.assertTrue(enc.success)
+        v = verify_file(enc.target, password="mypw")
+        self.assertTrue(v.success)
+        v2 = verify_file(enc.target, password="wrong")
+        self.assertFalse(v2.success)
+
+    def test_verify_directory_bulk(self):
+        key = generate_key()
+        for name in ["a.env", "b.yaml"]:
+            src = self._make_file(name, b"x")
+            r = encrypt_file(src, key=key)
+            self.assertTrue(r.success, r.error)
+            os.unlink(src)
+        results = verify_directory_bulk(self.tmpdir, key=key)
+        self.assertEqual(len(results), 2)
+        for r in results:
+            self.assertTrue(r.success, r.error)
+
+    def test_rekey_file_password_to_password(self):
+        src = self._make_file("rk.env", b"PAYLOAD=abc123")
+        enc = encrypt_file(src, password="oldpw")
+        self.assertTrue(enc.success)
+        os.unlink(src)
+        rk = rekey_file(enc.target, old_password="oldpw", new_password="newpw")
+        self.assertTrue(rk.success, rk.error)
+        old_verify = verify_file(enc.target, password="oldpw")
+        self.assertFalse(old_verify.success)
+        new_verify = verify_file(enc.target, password="newpw")
+        self.assertTrue(new_verify.success)
+        dec = decrypt_file(enc.target, password="newpw")
+        self.assertTrue(dec.success)
+        with open(dec.target, "rb") as f:
+            self.assertEqual(f.read(), b"PAYLOAD=abc123")
+
+    def test_rekey_file_key_to_key(self):
+        k1 = generate_key()
+        k2 = generate_key()
+        src = self._make_file("rk.env", b"data")
+        enc = encrypt_file(src, key=k1)
+        self.assertTrue(enc.success)
+        rk = rekey_file(enc.target, old_key=k1, new_key=k2)
+        self.assertTrue(rk.success, rk.error)
+        self.assertTrue(verify_file(enc.target, key=k2).success)
+        self.assertFalse(verify_file(enc.target, key=k1).success)
+
+    def test_rekey_file_wrong_old_key(self):
+        k1 = generate_key()
+        k2 = generate_key()
+        src = self._make_file("rk.env", b"data")
+        enc = encrypt_file(src, key=k1)
+        rk = rekey_file(enc.target, old_key=k2, new_key=k2)
+        self.assertFalse(rk.success)
+
+    def test_rekey_directory_bulk(self):
+        pwd_old = "old"
+        pwd_new = "new"
+        for n in ["a.env", "sub/b.yaml"]:
+            src = self._make_file(n, b"v")
+            r = encrypt_file(src, password=pwd_old)
+            self.assertTrue(r.success, r.error)
+            os.unlink(src)
+        results = rekey_directory_bulk(
+            self.tmpdir, old_password=pwd_old, new_password=pwd_new
+        )
+        self.assertEqual(len(results), 2)
+        for r in results:
+            self.assertTrue(r.success, r.error)
+        for r in verify_directory_bulk(self.tmpdir, password=pwd_new):
+            self.assertTrue(r.success, r.error)
+
+    def test_is_sensitive_file(self):
+        self.assertTrue(is_sensitive_file(".env"))
+        self.assertTrue(is_sensitive_file(".env.local"))
+        self.assertTrue(is_sensitive_file("app.yaml"))
+        self.assertTrue(is_sensitive_file("id_rsa"))
+        self.assertTrue(is_sensitive_file("server.pem"))
+        self.assertTrue(is_sensitive_file("ca.crt"))
+        self.assertTrue(is_sensitive_file("secret.key"))
+        self.assertFalse(is_sensitive_file("main.py"))
+        self.assertFalse(is_sensitive_file("notes.txt"))
+
+    def test_match_sensitive_files_local(self):
+        files = [
+            os.path.join(self.tmpdir, ".env"),
+            os.path.join(self.tmpdir, "key.pem"),
+            os.path.join(self.tmpdir, "code.py"),
+            os.path.join(self.tmpdir, "data.ccrypt"),
+        ]
+        sensitive = match_sensitive_files_local(files)
+        basenames = [os.path.basename(f) for f in sensitive]
+        self.assertIn(".env", basenames)
+        self.assertIn("key.pem", basenames)
+        self.assertNotIn("code.py", basenames)
+        self.assertNotIn("data.ccrypt", basenames)
+
 
 class TestCLI(unittest.TestCase):
     def setUp(self):
@@ -311,6 +461,66 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(rc, 0)
         finally:
             os.chdir(old_cwd)
+
+    def test_encrypt_decrypt_cli_with_p_password(self):
+        env_file = os.path.join(self.tmpdir, ".env")
+        with open(env_file, "w") as f:
+            f.write("SECRET=pwd-cli\n")
+        rc = self._run(["encrypt", env_file, "-p", "mysecret"])
+        self.assertEqual(rc, 0)
+        enc = env_file + DEFAULT_EXT
+        self.assertTrue(os.path.exists(enc))
+        os.unlink(env_file)
+        rc = self._run(["decrypt", enc, "-p", "mysecret"])
+        self.assertEqual(rc, 0)
+        with open(env_file) as f:
+            self.assertEqual(f.read(), "SECRET=pwd-cli\n")
+
+    def test_verify_cli(self):
+        f = os.path.join(self.tmpdir, "v.env")
+        with open(f, "w") as fh: fh.write("x=1\n")
+        self.assertEqual(self._run(["encrypt", f, "-p", "pw"]), 0)
+        enc = f + DEFAULT_EXT
+        self.assertEqual(self._run(["verify", enc, "-p", "pw"]), 0)
+        self.assertEqual(self._run(["verify", enc, "-p", "wrong"]), 1)
+
+    def test_verify_cli_directory(self):
+        for n in ["a.env", "b.yaml"]:
+            p = os.path.join(self.tmpdir, n)
+            with open(p, "w") as fh: fh.write("x\n")
+            self.assertEqual(self._run(["encrypt", p, "-p", "xx"]), 0)
+            os.unlink(p)
+        self.assertEqual(self._run(["verify", self.tmpdir, "-p", "xx"]), 0)
+        self.assertEqual(self._run(["verify", self.tmpdir, "-p", "bad"]), 1)
+
+    def test_rekey_cli(self):
+        f = os.path.join(self.tmpdir, "r.env")
+        with open(f, "w") as fh: fh.write("DATA=keep\n")
+        self.assertEqual(self._run(["encrypt", f, "-p", "old"]), 0)
+        enc = f + DEFAULT_EXT
+        os.unlink(f)
+        rc = self._run([
+            "rekey", enc, "--old-password", "old", "--new-password", "new",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._run(["verify", enc, "-p", "old"]), 1)
+        self.assertEqual(self._run(["verify", enc, "-p", "new"]), 0)
+
+    def test_check_cli_dir(self):
+        os.makedirs(os.path.join(self.tmpdir, "sub"), exist_ok=True)
+        Path(self.tmpdir, ".env").write_text("x=1")
+        Path(self.tmpdir, "sub", "key.pem").write_text("k")
+        Path(self.tmpdir, "notes.txt").write_text("hi")
+        self.assertEqual(self._run(["check", self.tmpdir]), 0)
+        self.assertEqual(self._run(["check", self.tmpdir, "--fail"]), 1)
+
+    def test_check_cli_file(self):
+        p = os.path.join(self.tmpdir, ".env")
+        with open(p, "w") as fh: fh.write("x=1\n")
+        self.assertEqual(self._run(["check", p, "--fail"]), 1)
+        p2 = os.path.join(self.tmpdir, "plain.txt")
+        with open(p2, "w") as fh: fh.write("ok\n")
+        self.assertEqual(self._run(["check", p2, "--fail"]), 0)
 
 
 if __name__ == "__main__":

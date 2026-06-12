@@ -11,6 +11,8 @@ from .crypto import (
     decrypt_data,
     encrypt_with_password,
     decrypt_with_password,
+    verify_data,
+    verify_with_password,
     CryptoError,
 )
 
@@ -27,6 +29,27 @@ CONFIG_EXTENSIONS = {
     ".conf",
     ".properties",
     ".config",
+}
+SENSITIVE_EXTENSIONS = CONFIG_EXTENSIONS | {
+    ".key",
+    ".pem",
+    ".crt",
+    ".cer",
+    ".p12",
+    ".pfx",
+    ".jks",
+    ".der",
+    ".pub",
+    ".prv",
+    ".secret",
+    ".sec",
+    ".pgp",
+    ".gpg",
+    ".asc",
+    ".kdbx",
+    ".keystore",
+    ".ts",
+    ".env.example",
 }
 
 
@@ -50,11 +73,90 @@ class DecryptResult:
     error: Optional[str] = None
 
 
+@dataclass
+class VerifyResult:
+    source: str
+    success: bool
+    error: Optional[str] = None
+
+
+def verify_file(
+    input_path: str,
+    *,
+    password: Optional[str] = None,
+    key: Optional[bytes] = None,
+) -> VerifyResult:
+    try:
+        ciphertext = read_file(input_path)
+        if key is not None:
+            verify_data(ciphertext, key)
+        elif password is not None:
+            verify_with_password(ciphertext, password)
+        else:
+            raise FileHandlerError("必须提供密码或密钥")
+        return VerifyResult(source=input_path, success=True)
+    except (CryptoError, FileHandlerError) as e:
+        return VerifyResult(source=input_path, success=False, error=str(e))
+
+
+def verify_directory_bulk(
+    dir_path: str,
+    *,
+    password: Optional[str] = None,
+    key: Optional[bytes] = None,
+    recursive: bool = True,
+) -> List[VerifyResult]:
+    root = Path(dir_path)
+    if not root.exists() or not root.is_dir():
+        raise FileHandlerError(f"目录不存在或不是目录: {dir_path}")
+
+    pattern = "**/*" + DEFAULT_EXT if recursive else "*" + DEFAULT_EXT
+    files = [str(p) for p in root.glob(pattern) if p.is_file()]
+    files.sort()
+
+    results = []
+    for f in files:
+        results.append(verify_file(f, password=password, key=key))
+    return results
+
+
 def is_config_file(path: str) -> bool:
     p = Path(path)
     if p.name.startswith(".env"):
         return True
     return p.suffix.lower() in CONFIG_EXTENSIONS
+
+
+def is_sensitive_file(path: str) -> bool:
+    p = Path(path)
+    name = p.name.lower()
+    if name.startswith(".env"):
+        return True
+    if name in {"id_rsa", "id_ed25519", "id_dsa", "id_ecdsa", "known_hosts", "authorized_keys"}:
+        return True
+    suffix = p.suffix.lower()
+    if suffix in SENSITIVE_EXTENSIONS:
+        return True
+    stem = p.stem.lower()
+    if stem.startswith(".env") and p.suffix.lower() in CONFIG_EXTENSIONS:
+        return True
+    return False
+
+
+def match_sensitive_files_local(
+    files: List[str],
+    patterns: Optional[List] = None,
+) -> List[str]:
+    matched = []
+    for f in files:
+        if f.endswith(DEFAULT_EXT):
+            continue
+        if patterns and any(p.match(os.path.basename(f)) or p.match(f.replace("\\", "/")) for p in patterns):
+            matched.append(f)
+            continue
+        if is_sensitive_file(f):
+            matched.append(f)
+    return matched
 
 
 def default_output_path(input_path: str, ext: str = DEFAULT_EXT, decrypt: bool = False) -> str:
@@ -320,3 +422,89 @@ def decrypt_directory_archive(
         return DecryptResult(
             source=input_path, target=output_dir, success=False, error=str(e)
         )
+
+
+@dataclass
+class RekeyResult:
+    source: str
+    success: bool
+    error: Optional[str] = None
+
+
+def rekey_file(
+    input_path: str,
+    *,
+    old_password: Optional[str] = None,
+    old_key: Optional[bytes] = None,
+    new_password: Optional[str] = None,
+    new_key: Optional[bytes] = None,
+) -> RekeyResult:
+    if not (old_password is not None or old_key is not None):
+        return RekeyResult(
+            source=input_path, success=False, error="必须提供旧密码或旧密钥"
+        )
+    if not (new_password is not None or new_key is not None):
+        return RekeyResult(
+            source=input_path, success=False, error="必须提供新密码或新密钥"
+        )
+
+    try:
+        ciphertext_old = read_file(input_path)
+
+        if old_key is not None:
+            plaintext = decrypt_data(ciphertext_old, old_key)
+        else:
+            plaintext = decrypt_with_password(ciphertext_old, old_password)
+
+        if new_key is not None:
+            ciphertext_new = encrypt_data(plaintext, new_key)
+        else:
+            ciphertext_new = encrypt_with_password(plaintext, new_password)
+
+        tmp_path = input_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(ciphertext_new)
+        os.replace(tmp_path, input_path)
+
+        return RekeyResult(source=input_path, success=True)
+    except (CryptoError, FileHandlerError, OSError) as e:
+        try:
+            tmp = input_path + ".tmp"
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        return RekeyResult(
+            source=input_path, success=False, error=str(e)
+        )
+
+
+def rekey_directory_bulk(
+    dir_path: str,
+    *,
+    old_password: Optional[str] = None,
+    old_key: Optional[bytes] = None,
+    new_password: Optional[str] = None,
+    new_key: Optional[bytes] = None,
+    recursive: bool = True,
+) -> List[RekeyResult]:
+    root = Path(dir_path)
+    if not root.exists() or not root.is_dir():
+        raise FileHandlerError(f"目录不存在或不是目录: {dir_path}")
+
+    pattern = "**/*" + DEFAULT_EXT if recursive else "*" + DEFAULT_EXT
+    files = [str(p) for p in root.glob(pattern) if p.is_file()]
+    files.sort()
+
+    results = []
+    for f in files:
+        results.append(
+            rekey_file(
+                f,
+                old_password=old_password,
+                old_key=old_key,
+                new_password=new_password,
+                new_key=new_key,
+            )
+        )
+    return results

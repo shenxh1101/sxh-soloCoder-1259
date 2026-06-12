@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from .filehandler import DEFAULT_EXT, is_config_file
+from .filehandler import DEFAULT_EXT, is_config_file, is_sensitive_file
 
 
 HOOK_MARKER = "# >>> config-crypt pre-commit hook >>>"
@@ -126,7 +126,7 @@ def match_sensitive_files(
             continue
         if any(p.match(rel) for p in patterns):
             matched.append(f)
-        elif is_config_file(f) and not f.endswith(DEFAULT_EXT):
+        elif is_sensitive_file(f) and not f.endswith(DEFAULT_EXT):
             matched.append(f)
     return matched
 
@@ -331,7 +331,9 @@ def precommit_hook_impl(
     if not sensitive:
         return 0
 
-    print(f"[config-crypt] 检测到 {len(sensitive)} 个敏感配置文件，正在自动加密...")
+    print(f"[config-crypt] 检测到 {len(sensitive)} 个明文敏感文件，正在自动加密并阻止明文提交...")
+    for f in sensitive:
+        print(f"  ⚠  {os.path.relpath(f, root)}")
 
     try:
         mode, key_or_pwd = resolve_key(
@@ -347,10 +349,16 @@ def precommit_hook_impl(
             f"  或在安装 hook 时使用 -k 指定密钥文件",
             file=sys.stderr,
         )
+        print(
+            f"[config-crypt] 提交被阻止：存在 {len(sensitive)} 个明文敏感文件未加密",
+            file=sys.stderr,
+        )
+        _unstage_files(root, sensitive)
         return 1
 
     failed = []
     encrypted_files = []
+    success_plaintext = []
 
     for f in sensitive:
         if mode == "keyfile":
@@ -361,6 +369,7 @@ def precommit_hook_impl(
         if res.success:
             print(f"  ✓ {os.path.relpath(f, root)} → {os.path.relpath(res.target, root)}")
             encrypted_files.append(res.target)
+            success_plaintext.append(f)
         else:
             print(f"  ✗ {os.path.relpath(f, root)}: {res.error}", file=sys.stderr)
             failed.append(f)
@@ -374,14 +383,35 @@ def precommit_hook_impl(
                 capture_output=True,
             )
         except subprocess.CalledProcessError as e:
-            print(f"[config-crypt] 警告: git add 失败: {e}", file=sys.stderr)
+            print(f"[config-crypt] 警告: git add 加密文件失败: {e}", file=sys.stderr)
+
+    _unstage_files(root, sensitive)
 
     if failed:
         print(
-            f"[config-crypt] 提交被阻止：{len(failed)} 个文件加密失败",
+            f"[config-crypt] 提交被阻止：{len(failed)} 个文件加密失败，"
+            f"{len(sensitive)} 个明文文件已从暂存区移除",
             file=sys.stderr,
         )
         return 1
 
-    print(f"[config-crypt] 已自动加密 {len(encrypted_files)} 个文件")
+    print(
+        f"[config-crypt] 已自动加密 {len(encrypted_files)} 个文件，"
+        f"明文文件已从暂存区移除（加密版本已加入暂存区）"
+    )
     return 0
+
+
+def _unstage_files(root: str, files: List[str]) -> None:
+    if not files:
+        return
+    rels = [os.path.relpath(f, root) for f in files]
+    try:
+        subprocess.run(
+            ["git", "reset", "HEAD", "--"] + rels,
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"[config-crypt] 警告: 从暂存区移除明文文件失败: {e}", file=sys.stderr)

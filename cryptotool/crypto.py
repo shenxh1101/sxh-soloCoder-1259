@@ -212,3 +212,33 @@ def decrypt_with_password(data: bytes, password: str) -> bytes:
 
 def generate_key() -> bytes:
     return os.urandom(KEY_SIZE)
+
+
+def verify_data(data: bytes, key: bytes) -> None:
+    if len(key) != KEY_SIZE:
+        raise CryptoError(f"密钥长度错误：需要 {KEY_SIZE} 字节，得到 {len(key)} 字节")
+
+    enc = EncryptedData.deserialize(data)
+
+    if not verify_checksum(enc):
+        raise TamperedError("文件已被篡改：校验和不匹配")
+
+    aesgcm = AESGCM(key)
+    try:
+        aesgcm.decrypt(enc.nonce, enc.ciphertext + enc.tag, enc.salt)
+    except InvalidTag:
+        raise PasswordError("验证失败：密钥错误或文件已损坏")
+
+
+def verify_with_password(data: bytes, password: str) -> None:
+    enc = EncryptedData.deserialize(data)
+
+    if not verify_checksum(enc):
+        raise TamperedError("文件已被篡改：校验和不匹配")
+
+    key = derive_key_from_password(password, enc.salt)
+    aesgcm = AESGCM(key)
+    try:
+        aesgcm.decrypt(enc.nonce, enc.ciphertext + enc.tag, enc.salt)
+    except InvalidTag:
+        raise PasswordError("验证失败：密码错误")

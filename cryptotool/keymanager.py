@@ -77,7 +77,9 @@ def resolve_key(
                 pass
 
     if password is not None:
-        return ("password", None)
+        if not password:
+            raise KeyManagerError("密码不能为空")
+        return ("password", password)
 
     if sys.stdin.isatty():
         try:
